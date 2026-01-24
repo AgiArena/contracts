@@ -42,8 +42,12 @@ contract ResolutionDAOSettlementTest is Test {
         // Deploy mock USDC
         usdc = new MockUSDC();
 
-        // Deploy AgiArenaCore
-        agiArenaCore = new AgiArenaCore(address(usdc), feeRecipient);
+        // Pre-compute ResolutionDAO address for AgiArenaCore's resolver parameter
+        uint64 currentNonce = vm.getNonce(address(this));
+        address predictedResolutionDAO = vm.computeCreateAddress(address(this), currentNonce + 1);
+
+        // Deploy AgiArenaCore with predicted ResolutionDAO as resolver
+        agiArenaCore = new AgiArenaCore(address(usdc), feeRecipient, predictedResolutionDAO);
 
         // Deploy ResolutionDAO with keeper1 as initial keeper
         resolutionDAO = new ResolutionDAO(keeper1, address(agiArenaCore));
@@ -82,9 +86,9 @@ contract ResolutionDAOSettlementTest is Test {
         bytes32 betHash = keccak256("test-portfolio");
         string memory jsonRef = "test-ref-123";
 
-        // Creator places bet
+        // Creator places bet with even odds (1.00x = 10000 bps)
         vm.prank(creator);
-        betId = agiArenaCore.placeBet(betHash, jsonRef, BET_AMOUNT);
+        betId = agiArenaCore.placeBet(betHash, jsonRef, BET_AMOUNT, 10000);
 
         // Filler matches bet
         vm.prank(filler);
@@ -362,7 +366,7 @@ contract ResolutionDAOSettlementTest is Test {
 
         bytes32 betHash = keccak256(abi.encode("fuzz-portfolio", amount));
         vm.prank(creator);
-        uint256 betId = agiArenaCore.placeBet(betHash, "fuzz-ref", amount);
+        uint256 betId = agiArenaCore.placeBet(betHash, "fuzz-ref", amount, 10000);
         vm.prank(filler);
         agiArenaCore.matchBet(betId, amount);
 

@@ -78,11 +78,19 @@ contract ResolutionDAOTest is Test {
         // Deploy mock USDC
         usdc = new MockUSDC();
 
-        // Deploy AgiArenaCore
-        agiArenaCore = new AgiArenaCore(address(usdc), feeRecipient);
+        // Pre-compute ResolutionDAO address for AgiArenaCore's resolver parameter
+        // AgiArenaCore will be at nonce N, ResolutionDAO at nonce N+1
+        uint64 currentNonce = vm.getNonce(address(this));
+        address predictedResolutionDAO = vm.computeCreateAddress(address(this), currentNonce + 1);
+
+        // Deploy AgiArenaCore with predicted ResolutionDAO as resolver
+        agiArenaCore = new AgiArenaCore(address(usdc), feeRecipient, predictedResolutionDAO);
 
         // Deploy ResolutionDAO with keeper1 as initial keeper
         resolutionDAO = new ResolutionDAO(keeper1, address(agiArenaCore));
+
+        // Verify prediction was correct
+        require(address(resolutionDAO) == predictedResolutionDAO, "ResolutionDAO address mismatch");
 
         // Add keeper2 via governance
         vm.prank(keeper1);
@@ -122,9 +130,9 @@ contract ResolutionDAOTest is Test {
         bytes32 betHash = keccak256(abi.encode("test-portfolio", block.timestamp));
         string memory jsonRef = "test-ref-123";
 
-        // Creator places bet
+        // Creator places bet with even odds (1.00x = 10000 bps)
         vm.prank(creator);
-        betId = agiArenaCore.placeBet(betHash, jsonRef, BET_AMOUNT);
+        betId = agiArenaCore.placeBet(betHash, jsonRef, BET_AMOUNT, 10000);
 
         // Filler matches bet
         vm.prank(filler);
@@ -1375,7 +1383,7 @@ contract ResolutionDAOTest is Test {
         uint256 minAmount = 10 * 1e6; // 10 USDC (minimum to avoid 0 reward)
 
         vm.prank(creator);
-        uint256 betId = agiArenaCore.placeBet(betHash, jsonRef, minAmount);
+        uint256 betId = agiArenaCore.placeBet(betHash, jsonRef, minAmount, 10000);
 
         vm.prank(filler);
         agiArenaCore.matchBet(betId, minAmount);

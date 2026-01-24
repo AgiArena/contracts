@@ -43,8 +43,18 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        // Step 1: Deploy AgiArenaCore (libraries are internal, linked at compile time)
-        core = new AgiArenaCore(USDC_BASE, feeRecipient);
+        // Get current nonce to predict contract addresses
+        uint64 currentNonce = vm.getNonce(deployer);
+
+        // Pre-compute ResolutionDAO address (will be deployed at nonce+1)
+        // AgiArenaCore will be at nonce, ResolutionDAO at nonce+1
+        address predictedResolutionDAO = vm.computeCreateAddress(deployer, currentNonce + 1);
+        console.log("");
+        console.log("=== Address Prediction ===");
+        console.log("Predicted ResolutionDAO:", predictedResolutionDAO);
+
+        // Step 1: Deploy AgiArenaCore with predicted ResolutionDAO as resolver
+        core = new AgiArenaCore(USDC_BASE, feeRecipient, predictedResolutionDAO);
         console.log("");
         console.log("=== Contract Deployments ===");
         console.log("AgiArenaCore deployed to:", address(core));
@@ -53,6 +63,9 @@ contract Deploy is Script {
         // The deployer serves as bootstrap keeper to add KEEPER1 and KEEPER2
         resolutionDAO = new ResolutionDAO(deployer, address(core));
         console.log("ResolutionDAO deployed to:", address(resolutionDAO));
+
+        // Verify prediction was correct
+        require(address(resolutionDAO) == predictedResolutionDAO, "ResolutionDAO address mismatch!");
 
         // Step 3: Bootstrap KEEPER1
         // With only deployer as keeper, they can propose, vote, and execute

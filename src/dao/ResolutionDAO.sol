@@ -18,12 +18,14 @@ interface IAgiArenaCore {
         Settled
     }
 
-    /// @notice Bet struct matching AgiArenaCore
+    /// @notice Bet struct matching AgiArenaCore (with odds support)
     struct Bet {
         bytes32 betHash;
         string jsonStorageRef;
-        uint256 amount;
+        uint256 creatorStake;      // Creator's USDC stake (6 decimals)
+        uint256 requiredMatch;     // Required matcher stake (calculated from odds)
         uint256 matchedAmount;
+        uint32 oddsBps;            // Odds in basis points (10000 = 1.00x)
         address creator;
         BetStatus status;
         uint256 createdAt;
@@ -36,12 +38,14 @@ interface IAgiArenaCore {
         uint256 filledAt;
     }
 
-    /// @notice Get bet data by ID
+    /// @notice Get bet data by ID (with odds support)
     function bets(uint256 betId) external view returns (
         bytes32 betHash,
         string memory jsonStorageRef,
-        uint256 amount,
+        uint256 creatorStake,
+        uint256 requiredMatch,
         uint256 matchedAmount,
+        uint32 oddsBps,
         address creator,
         BetStatus status,
         uint256 createdAt
@@ -235,6 +239,10 @@ contract ResolutionDAO is ReentrancyGuard {
 
     /// @notice Window after consensus during which disputes can be raised (2 hours)
     uint256 public constant DISPUTE_WINDOW = 2 hours;
+
+    /// @notice Consensus threshold in basis points (66.67% = 6667 BPS)
+    /// @dev With 3 keepers: need 2 votes (67%). With 2 keepers: need 2 votes (100%)
+    uint256 public constant CONSENSUS_THRESHOLD_BPS = 6667;
 
     /// @notice Duration of settlement pause during active dispute (48 hours)
     uint256 public constant DISPUTE_PAUSE_DURATION = 48 hours;
@@ -755,48 +763,57 @@ contract ResolutionDAO is ReentrancyGuard {
     /// @notice Check if keeper scores are within tolerance and have consensus
     /// @param betId The bet ID to check
     /// @param toleranceBps Tolerance in basis points (e.g., 10 = 0.1%)
-    /// @return hasConsensus Whether both keepers voted same outcome (creatorWins)
+    /// @return hasConsensus Whether sufficient keepers voted same outcome (67% threshold)
     /// @return withinTolerance Whether score difference is within tolerance
-    /// @return avgScore Average of keeper scores (0 if less than 2 votes)
-    /// @return scoreDiff Absolute difference between scores (0 if less than 2 votes)
+    /// @return avgScore Average of all keeper scores (0 if no votes)
+    /// @return scoreDiff Max score difference between any two votes (0 if less than 2 votes)
     function checkScoreConsensus(
         uint256 betId,
         uint256 toleranceBps
     ) external view returns (bool hasConsensus, bool withinTolerance, int256 avgScore, uint256 scoreDiff) {
         ScoreVote[] storage votes = _betScoreVotes[betId];
+        uint256 totalKeepers = keepers.length;
 
         // Edge case: no votes
         if (votes.length == 0) {
             return (false, false, 0, 0);
         }
 
-        // Edge case: single vote (no consensus possible)
-        if (votes.length == 1) {
+        // Edge case: single vote or insufficient keepers
+        if (votes.length == 1 || totalKeepers < 2) {
             return (false, false, votes[0].score, 0);
         }
 
-        // Check if all keepers agree on creatorWins (consensus on outcome)
-        bool firstVote = votes[0].creatorWins;
-        hasConsensus = true;
-        for (uint256 i = 1; i < votes.length; i++) {
-            if (votes[i].creatorWins != firstVote) {
-                hasConsensus = false;
-                break;
+        // Calculate required votes for consensus (67% of total keepers, minimum 2)
+        uint256 requiredVotes = (totalKeepers * CONSENSUS_THRESHOLD_BPS) / 10000;
+        if (requiredVotes < 2) requiredVotes = 2;
+
+        // Count votes for each outcome and calculate stats
+        uint256 creatorWinsVotes = 0;
+        uint256 matcherWinsVotes = 0;
+        int256 totalScore = 0;
+        int256 minScore = votes[0].score;
+        int256 maxScore = votes[0].score;
+
+        for (uint256 i = 0; i < votes.length; i++) {
+            if (votes[i].creatorWins) {
+                creatorWinsVotes++;
+            } else {
+                matcherWinsVotes++;
             }
+            totalScore += votes[i].score;
+            if (votes[i].score < minScore) minScore = votes[i].score;
+            if (votes[i].score > maxScore) maxScore = votes[i].score;
         }
 
-        // Calculate average score and difference (using first two votes for MVP)
-        // MVP LIMITATION: Only compares first 2 keeper votes. Future versions may support N-of-M consensus.
-        // Note: Average calculation is overflow-safe because scores are bounded to [-10000, 10000],
-        // so (score1 + score2) max is 20000, well within int256 range.
-        int256 score1 = votes[0].score;
-        int256 score2 = votes[1].score;
-        avgScore = (score1 + score2) / 2;
+        // Check if either outcome has reached consensus threshold
+        hasConsensus = creatorWinsVotes >= requiredVotes || matcherWinsVotes >= requiredVotes;
 
-        // Calculate absolute difference
-        // Safe: diff bounded by score range [-10000, 10000], abs(diff) <= 20000 fits in uint256
-        int256 diff = score1 - score2;
-        // forge-lint: disable-next-line(unsafe-typecast)
+        // Calculate average score
+        avgScore = totalScore / int256(votes.length);
+
+        // Calculate max score difference
+        int256 diff = maxScore - minScore;
         scoreDiff = diff >= 0 ? uint256(diff) : uint256(-diff);
 
         // Check if within tolerance
@@ -842,10 +859,10 @@ contract ResolutionDAO is ReentrancyGuard {
         }
 
         // Get bet data from AgiArenaCore
-        (uint256 amount, uint256 matchedAmount, address creator, address filler) = _getBetParties(betId);
+        (uint256 creatorStake, uint256 matchedAmount, address creator, address filler) = _getBetParties(betId);
 
         // Calculate total pot and platform fee
-        uint256 totalPot = amount + matchedAmount;
+        uint256 totalPot = creatorStake + matchedAmount;
         uint256 platformFee = (totalPot * PLATFORM_FEE_BPS) / 10000;
 
         // Check for tie (both scores exactly 0)
@@ -863,7 +880,7 @@ contract ResolutionDAO is ReentrancyGuard {
         bool isTie = (effectiveScore1 == 0 && effectiveScore2 == 0);
 
         if (isTie) {
-            _handleTieSettlement(betId, amount, matchedAmount, platformFee, totalPot, creator, filler);
+            _handleTieSettlement(betId, creatorStake, matchedAmount, platformFee, totalPot, creator, filler);
         } else {
             _handleWinnerSettlement(betId, creatorWins, platformFee, totalPot, creator, filler);
         }
@@ -872,22 +889,24 @@ contract ResolutionDAO is ReentrancyGuard {
     /// @dev Get bet parties from AgiArenaCore
     /// @notice Retrieves bet data and validates it's in a settleable state
     /// @param betId The bet ID to get parties for
-    /// @return amount The creator's original bet amount
+    /// @return creatorStake The creator's original bet amount
     /// @return matchedAmount The total matched amount from fillers
     /// @return creator The bet creator address
     /// @return filler The first filler address (MVP: single filler support)
     function _getBetParties(uint256 betId)
         internal
         view
-        returns (uint256 amount, uint256 matchedAmount, address creator, address filler)
+        returns (uint256 creatorStake, uint256 matchedAmount, address creator, address filler)
     {
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
         IAgiArenaCore.BetStatus status;
         (
             , // betHash - not needed for settlement
             , // jsonStorageRef - not needed for settlement
-            amount,
+            creatorStake,
+            , // requiredMatch - not needed for settlement, matchedAmount is the actual amount
             matchedAmount,
+            , // oddsBps - not needed for settlement (payout is creatorStake + matchedAmount)
             creator,
             status,
         ) = core.bets(betId);
@@ -1078,7 +1097,7 @@ contract ResolutionDAO is ReentrancyGuard {
 
         // Also verify bet is in settleable status
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
-        (, , , , , IAgiArenaCore.BetStatus status,) = core.bets(betId);
+        (, , , , , , , IAgiArenaCore.BetStatus status,) = core.bets(betId);
 
         // Only FullyMatched or PartiallyMatched bets can be settled
         return status == IAgiArenaCore.BetStatus.FullyMatched ||
@@ -1235,8 +1254,8 @@ contract ResolutionDAO is ReentrancyGuard {
         uint256 stakeAmount = dispute.stake;
 
         // Calculate reward: 5% of total pot
-        (uint256 amount, uint256 matchedAmount, , ) = _getBetParties(betId);
-        uint256 totalPot = amount + matchedAmount;
+        (uint256 creatorStake, uint256 matchedAmount, , ) = _getBetParties(betId);
+        uint256 totalPot = creatorStake + matchedAmount;
         uint256 reward = (totalPot * DISPUTE_REWARD_BPS) / 10000;
 
         // Clear stake to prevent double-refund (CEI pattern)
@@ -1366,56 +1385,72 @@ contract ResolutionDAO is ReentrancyGuard {
 
     /// @notice Check if consensus is reached for a bet
     /// @dev Emits ScoreConsensusReached if keepers agree, ScoreDivergence if they disagree or scores differ significantly
+    ///      Consensus requires CONSENSUS_THRESHOLD_BPS (~67%) of registered keepers to agree on outcome
     /// @param betId The bet ID to check
     function _checkConsensus(uint256 betId) internal {
         ScoreVote[] storage votes = _betScoreVotes[betId];
 
-        // Need at least 2 votes for consensus (MVP: 2-of-2)
-        if (votes.length < 2) return;
+        // Need at least 2 keepers and 2 votes for consensus
+        if (keepers.length < 2 || votes.length < 2) return;
 
-        // Get scores for comparison
-        int256 score1 = votes[0].score;
-        int256 score2 = votes[1].score;
+        // Calculate required votes for consensus (67% of total keepers, minimum 2)
+        uint256 requiredVotes = (keepers.length * CONSENSUS_THRESHOLD_BPS) / 10000;
+        if (requiredVotes < 2) requiredVotes = 2;
 
-        // Calculate absolute difference
-        // Safe: diff bounded by score range [-10000, 10000], abs(diff) <= 20000 fits in uint256
-        int256 diff = score1 - score2;
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 scoreDiff = diff >= 0 ? uint256(diff) : uint256(-diff);
+        // Count votes and calculate totals
+        (uint256 creatorWinsVotes, int256 totalScore) = _countVotes(votes);
+        uint256 matcherWinsVotes = votes.length - creatorWinsVotes;
 
-        // Check if all voters agree on creatorWins
-        bool firstVote = votes[0].creatorWins;
-        bool allAgree = true;
+        // Check if either outcome has reached consensus threshold
+        if ((creatorWinsVotes >= requiredVotes || matcherWinsVotes >= requiredVotes) && !consensusReached[betId]) {
+            _emitConsensus(betId, votes, creatorWinsVotes >= requiredVotes, totalScore);
+        } else if (creatorWinsVotes > 0 && matcherWinsVotes > 0) {
+            // Votes are split - emit divergence event
+            _emitDivergence(betId, votes[0].score, votes[1].score);
+        }
+    }
 
+    /// @dev Helper to count votes and total score
+    function _countVotes(ScoreVote[] storage votes) internal view returns (uint256 creatorWinsVotes, int256 totalScore) {
+        for (uint256 i = 0; i < votes.length; i++) {
+            if (votes[i].creatorWins) creatorWinsVotes++;
+            totalScore += votes[i].score;
+        }
+    }
+
+    /// @dev Helper to emit consensus events
+    function _emitConsensus(uint256 betId, ScoreVote[] storage votes, bool creatorWins, int256 totalScore) internal {
+        consensusReached[betId] = true;
+        consensusTimestamp[betId] = block.timestamp;
+
+        int256 avgScore = totalScore / int256(votes.length);
+        emit ScoreConsensusReached(betId, avgScore, creatorWins);
+
+        // DEPRECATED: Legacy event for backward compatibility
+        emit ConsensusReached(betId, creatorWins, votes[0].score, votes.length > 1 ? votes[1].score : votes[0].score);
+
+        // Check for score divergence
+        (int256 minScore, int256 maxScore) = _getScoreRange(votes);
+        if (uint256(maxScore - minScore) > DEFAULT_TOLERANCE_BPS) {
+            emit ScoreDivergence(betId, minScore, maxScore, uint256(maxScore - minScore));
+        }
+    }
+
+    /// @dev Helper to get min and max scores from votes
+    function _getScoreRange(ScoreVote[] storage votes) internal view returns (int256 minScore, int256 maxScore) {
+        minScore = votes[0].score;
+        maxScore = votes[0].score;
         for (uint256 i = 1; i < votes.length; i++) {
-            if (votes[i].creatorWins != firstVote) {
-                allAgree = false;
-                break;
-            }
+            if (votes[i].score < minScore) minScore = votes[i].score;
+            if (votes[i].score > maxScore) maxScore = votes[i].score;
         }
+    }
 
-        if (allAgree && !consensusReached[betId]) {
-            // Consensus reached - keepers agree on outcome
-            consensusReached[betId] = true;
-            consensusTimestamp[betId] = block.timestamp; // Story 3.4: Record consensus time for dispute window
-
-            // Calculate average score (overflow-safe: scores bounded to [-10000, 10000])
-            int256 avgScore = (score1 + score2) / 2;
-
-            // Emit new event (Story 3.2)
-            emit ScoreConsensusReached(betId, avgScore, firstVote);
-
-            // DEPRECATED: Keep legacy event for backward compatibility - remove after Q2 2026
-            emit ConsensusReached(betId, firstVote, score1, score2);
-
-            // Check for score divergence even if outcome agrees (tolerance-based)
-            if (scoreDiff > DEFAULT_TOLERANCE_BPS) {
-                emit ScoreDivergence(betId, score1, score2, scoreDiff);
-            }
-        } else if (!allAgree) {
-            // Outcomes differ - emit divergence event
-            emit ScoreDivergence(betId, score1, score2, scoreDiff);
-        }
+    /// @dev Helper to emit divergence event
+    function _emitDivergence(uint256 betId, int256 score1, int256 score2) internal {
+        int256 diff = score1 - score2;
+        uint256 scoreDiff = diff >= 0 ? uint256(diff) : uint256(-diff);
+        emit ScoreDivergence(betId, score1, score2, scoreDiff);
     }
 
     /// @notice Remove a keeper from the registry

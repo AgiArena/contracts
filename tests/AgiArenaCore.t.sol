@@ -20,12 +20,13 @@ contract MockUSDC is ERC20 {
 }
 
 /// @title AgiArenaCoreTest
-/// @notice Unit tests for AgiArenaCore smart contract
+/// @notice Unit tests for AgiArenaCore smart contract with asymmetric odds support
 contract AgiArenaCoreTest is Test {
     AgiArenaCore public core;
     MockUSDC public usdc;
 
     address public feeRecipient = address(0xFEE);
+    address public resolver = address(0xBE5);
     address public trader1 = address(0x1);
     address public trader2 = address(0x2);
     address public trader3 = address(0x3);
@@ -34,18 +35,32 @@ contract AgiArenaCoreTest is Test {
     bytes32 constant TEST_BET_HASH = keccak256(abi.encode("portfolio-1"));
     string constant TEST_JSON_REF = "agent-1-bet-123";
 
+    // Odds constants
+    uint32 constant ODDS_EVEN = 10000; // 1.00x (even odds)
+    uint32 constant ODDS_2X = 20000;   // 2.00x
+    uint32 constant ODDS_3X = 30000;   // 3.00x
+    uint32 constant ODDS_05X = 5000;   // 0.50x
+    uint32 constant ODDS_15X = 15000;  // 1.50x
+
     event BetPlaced(
-        uint256 indexed betId, address indexed creator, bytes32 betHash, string jsonStorageRef, uint256 amount
+        uint256 indexed betId,
+        address indexed creator,
+        bytes32 betHash,
+        string jsonStorageRef,
+        uint256 creatorStake,
+        uint256 requiredMatch,
+        uint32 oddsBps
     );
     event BetMatched(uint256 indexed betId, address indexed filler, uint256 fillAmount, uint256 remaining);
     event BetCancelled(uint256 indexed betId, address indexed creator, uint256 refundAmount);
+    event BetSettled(uint256 indexed betId, address indexed winner, uint256 payout, bool creatorWon);
 
     function setUp() public {
         // Deploy mock USDC
         usdc = new MockUSDC();
 
-        // Deploy AgiArenaCore
-        core = new AgiArenaCore(address(usdc), feeRecipient);
+        // Deploy AgiArenaCore with resolver
+        core = new AgiArenaCore(address(usdc), feeRecipient, resolver);
 
         // Fund test accounts
         usdc.mint(trader1, INITIAL_BALANCE);
@@ -68,27 +83,35 @@ contract AgiArenaCoreTest is Test {
     function test_Constructor() public view {
         assertEq(address(core.USDC()), address(usdc));
         assertEq(core.FEE_RECIPIENT(), feeRecipient);
+        assertEq(core.RESOLVER(), resolver);
         assertEq(core.PLATFORM_FEE_BPS(), 10);
+        assertEq(core.ODDS_EVEN(), 10000);
+        assertEq(core.MAX_MATCHERS(), 100);
         assertEq(core.nextBetId(), 0);
     }
 
     function test_Constructor_ZeroAddressUSDC() public {
         vm.expectRevert(AgiArenaCore.ZeroAddress.selector);
-        new AgiArenaCore(address(0), feeRecipient);
+        new AgiArenaCore(address(0), feeRecipient, resolver);
     }
 
     function test_Constructor_ZeroAddressFeeRecipient() public {
         vm.expectRevert(AgiArenaCore.ZeroAddress.selector);
-        new AgiArenaCore(address(usdc), address(0));
+        new AgiArenaCore(address(usdc), address(0), resolver);
     }
 
-    // ============ placeBet Tests ============
+    function test_Constructor_ZeroAddressResolver() public {
+        vm.expectRevert(AgiArenaCore.ZeroAddress.selector);
+        new AgiArenaCore(address(usdc), feeRecipient, address(0));
+    }
 
-    function test_PlacePortfolioBet() public {
-        uint256 betAmount = 1000e6; // 1k USDC
+    // ============ placeBet Tests with Odds ============
+
+    function test_PlacePortfolioBet_EvenOdds() public {
+        uint256 creatorStake = 1000e6; // 1k USDC
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
         // Verify bet ID
         assertEq(betId, 0);
@@ -98,56 +121,140 @@ contract AgiArenaCoreTest is Test {
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.betHash, TEST_BET_HASH);
         assertEq(bet.jsonStorageRef, TEST_JSON_REF);
-        assertEq(bet.amount, betAmount);
+        assertEq(bet.creatorStake, creatorStake);
+        assertEq(bet.requiredMatch, creatorStake); // 1.00x = equal stakes
         assertEq(bet.matchedAmount, 0);
+        assertEq(bet.oddsBps, ODDS_EVEN);
         assertEq(bet.creator, trader1);
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Pending));
 
         // Verify USDC transfer
-        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - betAmount);
-        assertEq(usdc.balanceOf(address(core)), betAmount);
+        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - creatorStake);
+        assertEq(usdc.balanceOf(address(core)), creatorStake);
     }
 
-    function test_PlacePortfolioBet_EmitsEvent() public {
-        uint256 betAmount = 500e6;
-
-        vm.expectEmit(true, true, false, true);
-        emit BetPlaced(0, trader1, TEST_BET_HASH, TEST_JSON_REF, betAmount);
+    function test_PlacePortfolioBet_2xOdds() public {
+        uint256 creatorStake = 1000e6;
+        // At 2.00x odds: requiredMatch = (1000 * 10000) / 20000 = 500
+        uint256 expectedRequiredMatch = 500e6;
 
         vm.prank(trader1);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.creatorStake, creatorStake);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, ODDS_2X);
+    }
+
+    function test_PlacePortfolioBet_05xOdds() public {
+        uint256 creatorStake = 1000e6;
+        // At 0.50x odds: requiredMatch = (1000 * 10000) / 5000 = 2000
+        uint256 expectedRequiredMatch = 2000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.creatorStake, creatorStake);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, ODDS_05X);
+    }
+
+    function test_PlacePortfolioBet_15xOdds() public {
+        uint256 creatorStake = 1000e6;
+        // At 1.50x odds: requiredMatch = (1000 * 10000) / 15000 = 666.666... = 666
+        uint256 expectedRequiredMatch = 666666666; // ~666.67 USDC (truncated)
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_15X);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.creatorStake, creatorStake);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, ODDS_15X);
+    }
+
+    function test_PlacePortfolioBet_EmitsEventWithOdds() public {
+        uint256 creatorStake = 500e6;
+        uint256 expectedRequiredMatch = 250e6; // 2.00x odds
+
+        vm.expectEmit(true, true, false, true);
+        emit BetPlaced(0, trader1, TEST_BET_HASH, TEST_JSON_REF, creatorStake, expectedRequiredMatch, ODDS_2X);
+
+        vm.prank(trader1);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+    }
+
+    function test_PlacePortfolioBet_InvalidOdds_Zero() public {
+        vm.prank(trader1);
+        vm.expectRevert(AgiArenaCore.InvalidOdds.selector);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, 0);
+    }
+
+    function test_PlacePortfolioBet_ExtremeOdds_1bps() public {
+        // 1 bps = 0.01% = 0.0001x - extreme but allowed (no min limit)
+        uint256 creatorStake = 1000e6;
+        // requiredMatch = (1000 * 10000) / 1 = 10_000_000 USDC
+        uint256 expectedRequiredMatch = 10_000_000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, 1);
+    }
+
+    function test_PlacePortfolioBet_ExtremeOdds_1000000bps() public {
+        // 1_000_000 bps = 100x odds (no max limit)
+        uint256 creatorStake = 1000e6;
+        // requiredMatch = (1000 * 10000) / 1_000_000 = 10 USDC
+        uint256 expectedRequiredMatch = 10e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1_000_000);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, 1_000_000);
+    }
+
+    function test_PlacePortfolioBet_RequiredMatchCantBeZero() public {
+        // If odds are very high and stake is small, requiredMatch could round to 0
+        // This should revert with ZeroAmount
+        // With 1 wei stake and max uint32 bps: (1 * 10000) / 4294967295 = 0 (truncated)
+        vm.prank(trader1);
+        vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1, type(uint32).max);
     }
 
     function test_PlacePortfolioBet_InsufficientBalance() public {
-        uint256 betAmount = INITIAL_BALANCE + 1; // More than balance
+        uint256 creatorStake = INITIAL_BALANCE + 1; // More than balance
 
         vm.prank(trader1);
-        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.InsufficientBalance.selector, betAmount, INITIAL_BALANCE));
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.InsufficientBalance.selector, creatorStake, INITIAL_BALANCE));
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
     }
 
     function test_PlacePortfolioBet_ZeroAmount() public {
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 0);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 0, ODDS_EVEN);
     }
 
     function test_PlacePortfolioBet_InvalidHash() public {
-        // Tests that contract rejects zero hash (bytes32(0))
-        // NOTE: The contract does NOT validate hash vs JSON content on-chain.
-        // Hash-to-JSON verification is done off-chain by backend/keepers using BettingLib.
-        // This is by design - storing/validating JSON on-chain would be prohibitively expensive.
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.InvalidBetHash.selector);
-        core.placeBet(bytes32(0), TEST_JSON_REF, 1000e6);
+        core.placeBet(bytes32(0), TEST_JSON_REF, 1000e6, ODDS_EVEN);
     }
 
     function test_PlaceMultipleBets() public {
         vm.startPrank(trader1);
 
-        uint256 bet1 = core.placeBet(TEST_BET_HASH, "ref-1", 100e6);
-        uint256 bet2 = core.placeBet(keccak256("portfolio-2"), "ref-2", 200e6);
-        uint256 bet3 = core.placeBet(keccak256("portfolio-3"), "ref-3", 300e6);
+        uint256 bet1 = core.placeBet(TEST_BET_HASH, "ref-1", 100e6, ODDS_EVEN);
+        uint256 bet2 = core.placeBet(keccak256("portfolio-2"), "ref-2", 200e6, ODDS_2X);
+        uint256 bet3 = core.placeBet(keccak256("portfolio-3"), "ref-3", 300e6, ODDS_05X);
 
         vm.stopPrank();
 
@@ -157,42 +264,58 @@ contract AgiArenaCoreTest is Test {
         assertEq(core.nextBetId(), 3);
     }
 
-    // ============ matchBet Tests ============
+    // ============ matchBet Tests with Odds ============
 
-    function test_MatchPortfolioBet_FullFill() public {
-        uint256 betAmount = 1000e6;
+    function test_MatchPortfolioBet_FullFill_EvenOdds() public {
+        uint256 creatorStake = 1000e6;
 
-        // Trader1 places bet
+        // Trader1 places bet with even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
-        // Trader2 fully matches
+        // Trader2 fully matches (requiredMatch == creatorStake at 1.00x)
         vm.prank(trader2);
-        core.matchBet(betId, betAmount);
+        core.matchBet(betId, creatorStake);
 
         // Verify bet state
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(bet.matchedAmount, betAmount);
+        assertEq(bet.matchedAmount, creatorStake);
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
 
         // Verify USDC transfers
-        assertEq(usdc.balanceOf(trader2), INITIAL_BALANCE - betAmount);
-        assertEq(usdc.balanceOf(address(core)), betAmount * 2); // Both traders' funds
-
-        // Verify fill record
-        assertEq(core.getBetFillCount(betId), 1);
-        AgiArenaCore.Fill[] memory fills = core.getBetFills(betId);
-        assertEq(fills[0].filler, trader2);
-        assertEq(fills[0].amount, betAmount);
+        assertEq(usdc.balanceOf(trader2), INITIAL_BALANCE - creatorStake);
+        assertEq(usdc.balanceOf(address(core)), creatorStake * 2); // Both traders' funds
     }
 
-    function test_MatchPortfolioBet_PartialFill() public {
-        uint256 betAmount = 1000e6;
-        uint256 fillAmount = 400e6;
+    function test_MatchPortfolioBet_FullFill_2xOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // At 2.00x odds
+
+        // Trader1 places bet with 2.00x odds
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        // Trader2 fully matches (only needs 500 USDC)
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        // Verify bet state
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.matchedAmount, requiredMatch);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
+
+        // Verify USDC in contract: 1000 from creator + 500 from matcher = 1500
+        assertEq(usdc.balanceOf(address(core)), creatorStake + requiredMatch);
+    }
+
+    function test_MatchPortfolioBet_PartialFill_2xOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // At 2.00x odds
+        uint256 fillAmount = 200e6;
 
         // Trader1 places bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
         // Trader2 partially matches
         vm.prank(trader2);
@@ -203,33 +326,31 @@ contract AgiArenaCoreTest is Test {
         assertEq(bet.matchedAmount, fillAmount);
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
 
-        // Verify remaining
-        assertEq(bet.amount - bet.matchedAmount, 600e6);
+        // Verify remaining is based on requiredMatch
+        assertEq(bet.requiredMatch - bet.matchedAmount, 300e6);
     }
 
-    function test_MatchPortfolioBet_MultipleFills() public {
-        // AC: test_MatchPortfolioBet_MultipleFills() - multiple users fill portions of same portfolio
-        uint256 betAmount = 1000e6;
+    function test_MatchPortfolioBet_MultipleFills_WithOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // At 2.00x odds
 
         // Trader1 places bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
-        // Trader2 partial fill
+        // Multiple partial fills
         vm.prank(trader2);
-        core.matchBet(betId, 300e6);
+        core.matchBet(betId, 150e6);
 
-        // Trader3 partial fill
         vm.prank(trader3);
-        core.matchBet(betId, 500e6);
+        core.matchBet(betId, 250e6);
 
-        // Trader2 another fill to complete
         vm.prank(trader2);
-        core.matchBet(betId, 200e6);
+        core.matchBet(betId, 100e6);
 
         // Verify bet state
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(bet.matchedAmount, betAmount);
+        assertEq(bet.matchedAmount, requiredMatch);
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
 
         // Verify fill records
@@ -237,17 +358,31 @@ contract AgiArenaCoreTest is Test {
     }
 
     function test_MatchPortfolioBet_EmitsEvent() public {
-        uint256 betAmount = 1000e6;
-        uint256 fillAmount = 400e6;
+        uint256 creatorStake = 1000e6;
+        uint256 fillAmount = 200e6;
+        uint256 remainingAfterFill = 300e6; // requiredMatch(500) - fill(200) = 300
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
         vm.expectEmit(true, true, false, true);
-        emit BetMatched(betId, trader2, fillAmount, 600e6);
+        emit BetMatched(betId, trader2, fillAmount, remainingAfterFill);
 
         vm.prank(trader2);
         core.matchBet(betId, fillAmount);
+    }
+
+    function test_MatchPortfolioBet_FillExceedsRemaining_WithOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // At 2.00x odds
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        // Try to fill more than requiredMatch
+        vm.prank(trader2);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.FillExceedsRemaining.selector, requiredMatch + 1, requiredMatch));
+        core.matchBet(betId, requiredMatch + 1);
     }
 
     function test_MatchPortfolioBet_BetNotFound() public {
@@ -258,33 +393,23 @@ contract AgiArenaCoreTest is Test {
 
     function test_MatchPortfolioBet_ZeroAmount() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
 
         vm.prank(trader2);
         vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
         core.matchBet(betId, 0);
     }
 
-    function test_MatchPortfolioBet_FillExceedsRemaining() public {
-        uint256 betAmount = 1000e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
-
-        vm.prank(trader2);
-        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.FillExceedsRemaining.selector, betAmount + 1, betAmount));
-        core.matchBet(betId, betAmount + 1);
-    }
-
     function test_MatchPortfolioBet_AlreadyFullyMatched() public {
-        uint256 betAmount = 1000e6;
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
         // Fully match
         vm.prank(trader2);
-        core.matchBet(betId, betAmount);
+        core.matchBet(betId, requiredMatch);
 
         // Try to match again
         vm.prank(trader3);
@@ -292,36 +417,11 @@ contract AgiArenaCoreTest is Test {
         core.matchBet(betId, 100e6);
     }
 
-    function test_MatchPortfolioBet_SelfMatch() public {
-        // Test that creator CAN match their own bet (allowed behavior)
-        uint256 betAmount = 1000e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
-
-        // Creator matches their own bet (self-match)
-        vm.prank(trader1);
-        core.matchBet(betId, betAmount);
-
-        // Verify bet is fully matched
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
-        assertEq(bet.matchedAmount, betAmount);
-
-        // Verify fill record shows trader1 as both creator and filler
-        AgiArenaCore.Fill[] memory fills = core.getBetFills(betId);
-        assertEq(fills[0].filler, trader1);
-
-        // Verify USDC balances: trader1 paid twice (place + match)
-        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - (betAmount * 2));
-        assertEq(usdc.balanceOf(address(core)), betAmount * 2);
-    }
-
     function test_MatchPortfolioBet_FillerInsufficientBalance() public {
-        uint256 betAmount = 1000e6;
+        uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
         // Drain trader2's balance
         vm.prank(trader2);
@@ -329,17 +429,17 @@ contract AgiArenaCoreTest is Test {
 
         // Try to match with no balance
         vm.prank(trader2);
-        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.InsufficientBalance.selector, betAmount, 0));
-        core.matchBet(betId, betAmount);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.InsufficientBalance.selector, creatorStake, 0));
+        core.matchBet(betId, creatorStake);
     }
 
-    // ============ cancelBet Tests ============
+    // ============ cancelBet Tests with Odds ============
 
-    function test_CancelPortfolioBet() public {
-        uint256 betAmount = 1000e6;
+    function test_CancelPortfolioBet_EvenOdds() public {
+        uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
         uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
@@ -351,30 +451,37 @@ contract AgiArenaCoreTest is Test {
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Cancelled));
 
         // Verify USDC refund
-        assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + betAmount);
+        assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + creatorStake);
         assertEq(usdc.balanceOf(address(core)), 0);
     }
 
-    function test_CancelPortfolioBet_EmitsEvent() public {
-        uint256 betAmount = 1000e6;
+    function test_CancelPortfolioBet_2xOdds() public {
+        uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
-        vm.expectEmit(true, true, false, true);
-        emit BetCancelled(betId, trader1, betAmount);
+        uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
         vm.prank(trader1);
         core.cancelBet(betId);
+
+        // Full refund of creatorStake
+        assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + creatorStake);
     }
 
-    function test_CancelPortfolioBet_PartiallyMatched() public {
-        uint256 betAmount = 1000e6;
-        uint256 matchedAmount = 400e6;
-        uint256 expectedRefund = betAmount - matchedAmount; // 600e6
+    function test_CancelPortfolioBet_PartiallyMatched_WithOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // 2.00x odds
+        uint256 matchedAmount = 200e6;
+
+        // Expected refund: creator gets back proportional to unmatched
+        // unmatched = 500 - 200 = 300 (60% unmatched)
+        // refund = 1000 * 300 / 500 = 600
+        uint256 expectedRefund = 600e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
         // Partially match
         vm.prank(trader2);
@@ -391,42 +498,38 @@ contract AgiArenaCoreTest is Test {
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
         assertEq(bet.matchedAmount, matchedAmount); // Still has the matched amount
 
-        // Verify only unfilled portion was refunded
+        // Verify refund of proportional unfilled portion
         assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + expectedRefund);
-        // Contract should still hold both traders' matched amounts
-        assertEq(usdc.balanceOf(address(core)), matchedAmount * 2);
+
+        // Contract should hold: creator's matched stake (400) + matcher's fill (200) = 600
+        assertEq(usdc.balanceOf(address(core)), 600e6);
     }
 
-    function test_CancelPortfolioBet_PartiallyMatchedEmitsEvent() public {
-        uint256 betAmount = 1000e6;
-        uint256 matchedAmount = 300e6;
-        uint256 expectedRefund = 700e6;
+    function test_CancelPortfolioBet_EmitsEvent() public {
+        uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
-
-        vm.prank(trader2);
-        core.matchBet(betId, matchedAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
         vm.expectEmit(true, true, false, true);
-        emit BetCancelled(betId, trader1, expectedRefund);
+        emit BetCancelled(betId, trader1, creatorStake);
 
         vm.prank(trader1);
         core.cancelBet(betId);
     }
 
     function test_CancelPortfolioBet_AlreadyMatched() public {
-        // AC: test_CancelPortfolioBet_AlreadyMatched() - revert if bet already matched
-        uint256 betAmount = 1000e6;
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
 
         // Fully match
         vm.prank(trader2);
-        core.matchBet(betId, betAmount);
+        core.matchBet(betId, requiredMatch);
 
-        // Try to cancel - should fail because bet is fully matched (not pending/partial)
+        // Try to cancel - should fail because bet is fully matched
         vm.prank(trader1);
         vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetNotPending.selector, betId));
         core.cancelBet(betId);
@@ -434,7 +537,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_CancelPortfolioBet_Unauthorized() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
 
         // Try to cancel as different user
         vm.prank(trader2);
@@ -448,17 +551,52 @@ contract AgiArenaCoreTest is Test {
         core.cancelBet(999);
     }
 
-    function test_CancelPortfolioBet_AlreadyCancelled() public {
+    function test_CancelPortfolioBet_FullyUnmatched_WithOdds() public {
+        // Verify that cancelling an unmatched bet at non-even odds returns EXACT creatorStake
+        uint256 creatorStake = 1000e6;
+
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
         vm.prank(trader1);
         core.cancelBet(betId);
 
-        // Try to cancel again
+        // EXACT refund - no rounding loss allowed
+        assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + creatorStake, "Full refund expected");
+        assertEq(usdc.balanceOf(address(core)), 0, "Contract should be empty");
+    }
+
+    function test_CancelPortfolioBet_3xOdds() public {
+        // Test 3.00x odds cancellation
+        uint256 creatorStake = 900e6; // Use value divisible by 3 for clean math
+        // requiredMatch = 900 * 10000 / 30000 = 300
+
         vm.prank(trader1);
-        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetNotPending.selector, betId));
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.requiredMatch, 300e6);
+
+        uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
+
+        vm.prank(trader1);
         core.cancelBet(betId);
+
+        assertEq(usdc.balanceOf(trader1), balanceBeforeCancel + creatorStake);
+    }
+
+    // ============ Self-Matching Prevention Tests ============
+
+    function test_MatchPortfolioBet_CannotSelfMatch() public {
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+
+        // Creator trying to match their own bet should fail
+        vm.prank(trader1);
+        vm.expectRevert(AgiArenaCore.CannotMatchOwnBet.selector);
+        core.matchBet(betId, 500e6);
     }
 
     // ============ getBetState Tests ============
@@ -468,27 +606,93 @@ contract AgiArenaCoreTest is Test {
         core.getBetState(999);
     }
 
-    // ============ Fuzz Tests ============
+    // ============ Backwards Compatibility Tests (AC: 6) ============
 
-    function testFuzz_PlaceBet(uint256 amount) public {
-        // Bound amount to reasonable values (1 USDC to initial balance)
-        amount = bound(amount, 1e6, INITIAL_BALANCE);
+    function test_BackwardsCompatibility_EvenOdds_BehavesLike1to1() public {
+        uint256 creatorStake = 1000e6;
 
+        // Place bet with even odds (1.00x)
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, amount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
 
+        // Verify requiredMatch equals creatorStake
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(bet.amount, amount);
-        assertEq(usdc.balanceOf(address(core)), amount);
+        assertEq(bet.requiredMatch, bet.creatorStake, "At 1.00x, requiredMatch should equal creatorStake");
+
+        // Match with equal amount
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
+
+        // Total in contract should be 2x creator stake
+        assertEq(usdc.balanceOf(address(core)), creatorStake * 2);
     }
 
-    function testFuzz_MatchBet(uint256 betAmount, uint256 fillAmount) public {
-        // Bound amounts
-        betAmount = bound(betAmount, 1e6, INITIAL_BALANCE);
-        fillAmount = bound(fillAmount, 1, betAmount);
+    function test_BackwardsCompatibility_MatchingLogicUnchangedAtEvenOdds() public {
+        uint256 creatorStake = 1000e6;
+
+        // Place bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        // Partial fill
+        vm.prank(trader2);
+        core.matchBet(betId, 300e6);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.matchedAmount, 300e6);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
+        assertEq(bet.requiredMatch - bet.matchedAmount, 700e6); // Remaining
+
+        // Complete fill
+        vm.prank(trader3);
+        core.matchBet(betId, 700e6);
+
+        bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
+    }
+
+    // ============ Fuzz Tests ============
+
+    function testFuzz_PlaceBet_WithOdds(uint256 creatorStake, uint32 oddsBps) public {
+        // Bound creatorStake to reasonable values
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        // Bound odds to non-zero and reasonable range
+        oddsBps = uint32(bound(oddsBps, 1, 1_000_000)); // 0.01% to 100x
+
+        // Calculate expected requiredMatch
+        uint256 expectedRequiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+
+        // Skip if requiredMatch would be 0 (dust bet prevention)
+        if (expectedRequiredMatch == 0) return;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.creatorStake, creatorStake);
+        assertEq(bet.requiredMatch, expectedRequiredMatch);
+        assertEq(bet.oddsBps, oddsBps);
+        assertEq(usdc.balanceOf(address(core)), creatorStake);
+    }
+
+    function testFuzz_MatchBet_WithOdds(uint256 creatorStake, uint32 oddsBps, uint256 fillAmount) public {
+        // Bound creatorStake
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        // Bound odds
+        oddsBps = uint32(bound(oddsBps, 1, 100_000)); // Max 10x to avoid huge requiredMatch
+
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+        if (requiredMatch == 0) return;
+
+        // Bound fillAmount to valid range
+        fillAmount = bound(fillAmount, 1, requiredMatch);
+        if (fillAmount > INITIAL_BALANCE) return; // Skip if filler can't afford
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
 
         vm.prank(trader2);
         core.matchBet(betId, fillAmount);
@@ -497,14 +701,662 @@ contract AgiArenaCoreTest is Test {
         assertEq(bet.matchedAmount, fillAmount);
     }
 
-    // ============ Large Portfolio Tests (AC: 1, 2) ============
+    function testFuzz_OddsBps(uint32 oddsBps) public {
+        // Test any non-zero odds value
+        vm.assume(oddsBps > 0);
 
-    /// @notice Helper function to generate a large portfolio JSON reference string
-    /// @param numMarkets Number of markets to simulate in the reference
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+
+        // Skip if requiredMatch is 0
+        vm.assume(requiredMatch > 0);
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(bet.oddsBps, oddsBps);
+        assertEq(bet.requiredMatch, requiredMatch);
+    }
+
+    function testFuzz_CancelBet_ProportionalRefund(uint256 creatorStake, uint32 oddsBps, uint256 fillPercent) public {
+        // Bound inputs
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        oddsBps = uint32(bound(oddsBps, 100, 100_000)); // 0.01x to 10x odds
+        fillPercent = bound(fillPercent, 1, 99); // 1-99% filled (not 0% or 100%)
+
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+        if (requiredMatch == 0) return;
+
+        // Calculate fill amount based on percentage
+        uint256 fillAmount = (requiredMatch * fillPercent) / 100;
+        if (fillAmount == 0 || fillAmount >= requiredMatch) return;
+        if (fillAmount > INITIAL_BALANCE) return;
+
+        // Place bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        // Partially match
+        vm.prank(trader2);
+        core.matchBet(betId, fillAmount);
+
+        uint256 balanceBefore = usdc.balanceOf(trader1);
+        uint256 contractBalanceBefore = usdc.balanceOf(address(core));
+
+        // Cancel remaining
+        vm.prank(trader1);
+        core.cancelBet(betId);
+
+        // Calculate expected refund proportionally
+        uint256 unmatchedRatio = requiredMatch - fillAmount;
+        uint256 expectedRefund = (creatorStake * unmatchedRatio) / requiredMatch;
+
+        // Verify refund
+        uint256 actualRefund = usdc.balanceOf(trader1) - balanceBefore;
+        assertEq(actualRefund, expectedRefund, "Proportional refund mismatch");
+
+        // Verify contract balance decreased by refund
+        assertEq(usdc.balanceOf(address(core)), contractBalanceBefore - expectedRefund);
+    }
+
+    function testFuzz_CancelBet_FullyUnmatched(uint256 creatorStake, uint32 oddsBps) public {
+        // Bound inputs
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        oddsBps = uint32(bound(oddsBps, 1, 1_000_000)); // Very wide range
+
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+        if (requiredMatch == 0) return;
+
+        // Place bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        uint256 balanceBefore = usdc.balanceOf(trader1);
+
+        // Cancel without any fills
+        vm.prank(trader1);
+        core.cancelBet(betId);
+
+        // MUST get exact creatorStake back - no rounding loss allowed
+        assertEq(usdc.balanceOf(trader1), balanceBefore + creatorStake, "Exact refund required");
+        assertEq(usdc.balanceOf(address(core)), 0, "Contract should be empty");
+    }
+
+    // ============ Odds Calculation Tests ============
+
+    function test_OddsCalculation_Examples() public {
+        // Test the examples from the architecture doc
+        uint256 creatorStake = 100e6; // $100
+
+        // 2.00x odds: requiredMatch = $50
+        vm.prank(trader1);
+        uint256 bet1 = core.placeBet(keccak256("bet1"), "ref1", creatorStake, 20000);
+        assertEq(core.getBetState(bet1).requiredMatch, 50e6);
+
+        // 1.50x odds: requiredMatch = ~$66.67
+        vm.prank(trader1);
+        uint256 bet2 = core.placeBet(keccak256("bet2"), "ref2", creatorStake, 15000);
+        assertEq(core.getBetState(bet2).requiredMatch, 66666666); // ~66.67
+
+        // 1.00x odds: requiredMatch = $100
+        vm.prank(trader1);
+        uint256 bet3 = core.placeBet(keccak256("bet3"), "ref3", creatorStake, 10000);
+        assertEq(core.getBetState(bet3).requiredMatch, 100e6);
+
+        // 0.50x odds: requiredMatch = $200
+        vm.prank(trader1);
+        uint256 bet4 = core.placeBet(keccak256("bet4"), "ref4", creatorStake, 5000);
+        assertEq(core.getBetState(bet4).requiredMatch, 200e6);
+    }
+
+    // ============ Integration Tests ============
+
+    function test_FullBettingFlow_WithOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint32 odds = ODDS_2X; // 2.00x
+        uint256 requiredMatch = 500e6;
+
+        // Step 1: Place bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, odds);
+
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Pending));
+        assertEq(bet.requiredMatch, requiredMatch);
+
+        // Step 2: First partial fill (30% of requiredMatch)
+        vm.prank(trader2);
+        core.matchBet(betId, 150e6);
+
+        bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
+        assertEq(bet.matchedAmount, 150e6);
+
+        // Step 3: Second partial fill (50% of requiredMatch)
+        vm.prank(trader3);
+        core.matchBet(betId, 250e6);
+
+        bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
+        assertEq(bet.matchedAmount, 400e6);
+
+        // Step 4: Final fill (20% of requiredMatch) - completes the bet
+        vm.prank(trader2);
+        core.matchBet(betId, 100e6);
+
+        bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
+        assertEq(bet.matchedAmount, 500e6);
+
+        // Verify USDC balances
+        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - creatorStake);
+        assertEq(usdc.balanceOf(trader2), INITIAL_BALANCE - 250e6); // 150 + 100
+        assertEq(usdc.balanceOf(trader3), INITIAL_BALANCE - 250e6);
+        assertEq(usdc.balanceOf(address(core)), creatorStake + requiredMatch); // 1500 total
+    }
+
+    function test_BetStateTransitions_WithOdds() public {
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_2X);
+        // requiredMatch = 500e6
+
+        // Initial: Pending
+        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.Pending));
+
+        // After partial: PartiallyMatched
+        vm.prank(trader2);
+        core.matchBet(betId, 100e6);
+        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
+
+        // After full: FullyMatched
+        vm.prank(trader2);
+        core.matchBet(betId, 400e6);
+        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.FullyMatched));
+    }
+
+    // ============ settleBet Tests ============
+
+    function test_SettleBet_CreatorWins_EvenOdds() public {
+        uint256 creatorStake = 1000e6;
+
+        // Place and fully match bet at even odds
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        // Track balances before settlement
+        uint256 trader1BalanceBefore = usdc.balanceOf(trader1);
+        uint256 feeRecipientBalanceBefore = usdc.balanceOf(feeRecipient);
+
+        // Resolver settles - creator wins
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Verify bet status
+        AgiArenaCore.Bet memory bet = core.getBetState(betId);
+        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Settled));
+
+        // Calculate expected payout
+        uint256 totalPot = creatorStake * 2; // 2000e6
+        uint256 platformFee = (totalPot * 10) / 10000; // 0.1% = 0.2e6
+        uint256 expectedPayout = totalPot - platformFee; // 1999.8e6
+
+        // Verify transfers
+        assertEq(usdc.balanceOf(trader1), trader1BalanceBefore + expectedPayout);
+        assertEq(usdc.balanceOf(feeRecipient), feeRecipientBalanceBefore + platformFee);
+        assertEq(usdc.balanceOf(address(core)), 0);
+    }
+
+    function test_SettleBet_CreatorWins_2xOdds() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // 2.00x odds
+
+        // Place and fully match bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        uint256 trader1BalanceBefore = usdc.balanceOf(trader1);
+
+        // Settle - creator wins
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Total pot = 1000 + 500 = 1500
+        // Fee = 1500 * 0.001 = 1.5
+        // Payout = 1500 - 1.5 = 1498.5
+        uint256 totalPot = creatorStake + requiredMatch;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        assertEq(usdc.balanceOf(trader1), trader1BalanceBefore + expectedPayout);
+    }
+
+    function test_SettleBet_MatcherWins_SingleMatcher() public {
+        uint256 creatorStake = 1000e6;
+
+        // Place and match at even odds
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        uint256 trader2BalanceBefore = usdc.balanceOf(trader2);
+
+        // Settle - matcher wins
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        uint256 totalPot = creatorStake * 2;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        // Single matcher gets entire payout
+        assertEq(usdc.balanceOf(trader2), trader2BalanceBefore + expectedPayout);
+    }
+
+    function test_SettleBet_MatcherWins_MultipleMatchers_Proportional() public {
+        uint256 creatorStake = 1000e6;
+        uint256 requiredMatch = 500e6; // 2.00x odds
+
+        // Place bet
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+
+        // Multiple matchers - trader2 fills 300, trader3 fills 200
+        vm.prank(trader2);
+        core.matchBet(betId, 300e6); // 60% of requiredMatch
+
+        vm.prank(trader3);
+        core.matchBet(betId, 200e6); // 40% of requiredMatch
+
+        uint256 trader2BalanceBefore = usdc.balanceOf(trader2);
+        uint256 trader3BalanceBefore = usdc.balanceOf(trader3);
+
+        // Settle - matchers win
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        // Total pot = 1000 + 500 = 1500
+        // Fee = 1.5e6
+        // Distributable = 1498.5e6
+        uint256 totalPot = creatorStake + requiredMatch;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 distributable = totalPot - platformFee;
+
+        // Trader2 share: 300/500 * 1498.5 = 899.1 (truncated)
+        uint256 trader2ExpectedShare = (distributable * 300e6) / requiredMatch;
+        // Trader3 gets remainder: 1498.5 - 899.1 = 599.4
+        uint256 trader3ExpectedShare = distributable - trader2ExpectedShare;
+
+        assertEq(usdc.balanceOf(trader2), trader2BalanceBefore + trader2ExpectedShare, "Trader2 share wrong");
+        assertEq(usdc.balanceOf(trader3), trader3BalanceBefore + trader3ExpectedShare, "Trader3 share wrong");
+    }
+
+    function test_SettleBet_MatcherWins_ThreeMatchers() public {
+        uint256 creatorStake = 1000e6;
+
+        // Place bet at even odds
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        // Three matchers with different fill amounts
+        address trader4 = address(0x4);
+        usdc.mint(trader4, INITIAL_BALANCE);
+        vm.prank(trader4);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(trader2);
+        core.matchBet(betId, 500e6); // 50%
+
+        vm.prank(trader3);
+        core.matchBet(betId, 300e6); // 30%
+
+        vm.prank(trader4);
+        core.matchBet(betId, 200e6); // 20%
+
+        uint256 trader2Before = usdc.balanceOf(trader2);
+        uint256 trader3Before = usdc.balanceOf(trader3);
+        uint256 trader4Before = usdc.balanceOf(trader4);
+
+        // Settle
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        uint256 totalPot = 2000e6;
+        uint256 platformFee = (totalPot * 10) / 10000; // 2e6 / 10 = 0.2e6
+        uint256 distributable = totalPot - platformFee;
+
+        // Proportional shares
+        uint256 trader2Share = (distributable * 500e6) / 1000e6;
+        uint256 trader3Share = (distributable * 300e6) / 1000e6;
+        uint256 trader4Share = distributable - trader2Share - trader3Share; // Remainder
+
+        assertEq(usdc.balanceOf(trader2), trader2Before + trader2Share);
+        assertEq(usdc.balanceOf(trader3), trader3Before + trader3Share);
+        assertEq(usdc.balanceOf(trader4), trader4Before + trader4Share);
+    }
+
+    function test_SettleBet_EmitsEvent_CreatorWins() public {
+        uint256 creatorStake = 1000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        uint256 totalPot = creatorStake * 2;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        vm.expectEmit(true, true, false, true);
+        emit BetSettled(betId, trader1, expectedPayout, true);
+
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+    }
+
+    function test_SettleBet_EmitsEvent_MatcherWins() public {
+        uint256 creatorStake = 1000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        uint256 totalPot = creatorStake * 2;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        vm.expectEmit(true, true, false, true);
+        emit BetSettled(betId, address(0), expectedPayout, false);
+
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+    }
+
+    function test_SettleBet_NotResolver() public {
+        uint256 creatorStake = 1000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        // Non-resolver tries to settle
+        vm.prank(trader1);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.NotResolver.selector, trader1));
+        core.settleBet(betId, true);
+    }
+
+    function test_SettleBet_BetNotFound() public {
+        vm.prank(resolver);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetNotFound.selector, 999));
+        core.settleBet(999, true);
+    }
+
+    function test_SettleBet_BetNotFullyMatched_Pending() public {
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+
+        // Bet is pending, not fully matched
+        vm.prank(resolver);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetNotFullyMatched.selector, betId));
+        core.settleBet(betId, true);
+    }
+
+    function test_SettleBet_BetNotFullyMatched_PartiallyMatched() public {
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, 500e6); // Only partially matched
+
+        vm.prank(resolver);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetNotFullyMatched.selector, betId));
+        core.settleBet(betId, true);
+    }
+
+    function test_SettleBet_AlreadySettled() public {
+        uint256 creatorStake = 1000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, creatorStake);
+
+        // First settlement
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Second attempt should fail with BetAlreadySettled
+        vm.prank(resolver);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.BetAlreadySettled.selector, betId));
+        core.settleBet(betId, true);
+    }
+
+    function test_SettleBet_SameMatcherMultipleFills() public {
+        uint256 creatorStake = 1000e6;
+
+        // Place bet at even odds
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        // Same matcher fills multiple times
+        vm.prank(trader2);
+        core.matchBet(betId, 400e6); // First fill
+
+        vm.prank(trader2);
+        core.matchBet(betId, 350e6); // Second fill
+
+        vm.prank(trader2);
+        core.matchBet(betId, 250e6); // Third fill (totals 1000e6)
+
+        uint256 trader2Before = usdc.balanceOf(trader2);
+
+        // Settle - matchers win (same address gets all three payments)
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        uint256 totalPot = 2000e6;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 payout = totalPot - platformFee;
+
+        // Trader2 should get entire payout (three separate transfers but same recipient)
+        assertEq(usdc.balanceOf(trader2), trader2Before + payout);
+        assertEq(usdc.balanceOf(address(core)), 0);
+    }
+
+    function test_SettleBet_AsymmetricOdds_0_5x_MatcherWins() public {
+        // 0.50x odds: creator stakes $50, matcher stakes $100
+        uint256 creatorStake = 50e6;
+        uint256 requiredMatch = 100e6; // 0.50x odds
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X);
+
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        uint256 trader2Before = usdc.balanceOf(trader2);
+
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        // Total pot = 150e6, fee = 0.15e6, payout = 149.85e6
+        uint256 totalPot = 150e6;
+        uint256 platformFee = (totalPot * 10) / 10000; // 15000 = 0.015e6
+        uint256 payout = totalPot - platformFee;
+
+        assertEq(usdc.balanceOf(trader2), trader2Before + payout);
+    }
+
+    function test_SettleBet_AsymmetricOdds_3x_CreatorWins() public {
+        // 3.00x odds: creator stakes $900, matcher stakes $300
+        uint256 creatorStake = 900e6;
+        uint256 requiredMatch = 300e6; // 3.00x odds
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X);
+
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        uint256 trader1Before = usdc.balanceOf(trader1);
+
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Total pot = 1200e6, fee = 1.2e6, payout = 1198.8e6
+        uint256 totalPot = 1200e6;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 payout = totalPot - platformFee;
+
+        assertEq(usdc.balanceOf(trader1), trader1Before + payout);
+    }
+
+    function test_SettleBet_MaxMatchers() public {
+        // Test with MAX_MATCHERS (100) fills
+        uint256 creatorStake = 10000e6;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        // Create 100 matchers, each filling 100e6
+        for (uint256 i = 0; i < 100; i++) {
+            address matcher = address(uint160(100 + i));
+            usdc.mint(matcher, 100e6);
+            vm.prank(matcher);
+            usdc.approve(address(core), type(uint256).max);
+            vm.prank(matcher);
+            core.matchBet(betId, 100e6);
+        }
+
+        // Settlement should succeed
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        // Verify bet is settled
+        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.Settled));
+
+        // Verify contract has no remaining balance
+        assertEq(usdc.balanceOf(address(core)), 0);
+    }
+
+    function test_MatchBet_TooManyMatchers() public {
+        uint256 creatorStake = 10100e6;
+
+        // Mint extra USDC for trader1 to cover the full bet
+        usdc.mint(trader1, 200e6);
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        // Create MAX_MATCHERS (100) fills
+        for (uint256 i = 0; i < 100; i++) {
+            address matcher = address(uint160(100 + i));
+            usdc.mint(matcher, 100e6);
+            vm.prank(matcher);
+            usdc.approve(address(core), type(uint256).max);
+            vm.prank(matcher);
+            core.matchBet(betId, 100e6);
+        }
+
+        // 101st matcher should fail
+        address extraMatcher = address(uint160(200));
+        usdc.mint(extraMatcher, 100e6);
+        vm.prank(extraMatcher);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(extraMatcher);
+        vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.TooManyMatchers.selector, 101, 100));
+        core.matchBet(betId, 100e6);
+    }
+
+    function test_SettleBet_ZeroFee_SmallPot() public {
+        // Small pot where fee rounds to 0
+        uint256 creatorStake = 1; // 0.000001 USDC
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+
+        vm.prank(trader2);
+        core.matchBet(betId, 1);
+
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Total pot = 2, fee = 0 (truncated), payout = 2
+        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - 1 + 2);
+    }
+
+    function testFuzz_SettleBet_CreatorWins(uint256 creatorStake, uint32 oddsBps) public {
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        oddsBps = uint32(bound(oddsBps, 100, 100_000));
+
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+        if (requiredMatch == 0 || requiredMatch > INITIAL_BALANCE) return;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        uint256 trader1Before = usdc.balanceOf(trader1);
+
+        vm.prank(resolver);
+        core.settleBet(betId, true);
+
+        // Verify creator received payout
+        uint256 totalPot = creatorStake + requiredMatch;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        assertEq(usdc.balanceOf(trader1), trader1Before + expectedPayout);
+        assertEq(usdc.balanceOf(address(core)), 0);
+    }
+
+    function testFuzz_SettleBet_MatcherWins(uint256 creatorStake, uint32 oddsBps) public {
+        creatorStake = bound(creatorStake, 1e6, INITIAL_BALANCE);
+        oddsBps = uint32(bound(oddsBps, 100, 100_000));
+
+        uint256 requiredMatch = (creatorStake * ODDS_EVEN) / oddsBps;
+        if (requiredMatch == 0 || requiredMatch > INITIAL_BALANCE) return;
+
+        vm.prank(trader1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+
+        vm.prank(trader2);
+        core.matchBet(betId, requiredMatch);
+
+        uint256 trader2Before = usdc.balanceOf(trader2);
+
+        vm.prank(resolver);
+        core.settleBet(betId, false);
+
+        // Verify matcher received payout
+        uint256 totalPot = creatorStake + requiredMatch;
+        uint256 platformFee = (totalPot * 10) / 10000;
+        uint256 expectedPayout = totalPot - platformFee;
+
+        assertEq(usdc.balanceOf(trader2), trader2Before + expectedPayout);
+        assertEq(usdc.balanceOf(address(core)), 0);
+    }
+
+    // ============ Helper Functions ============
+
     function _generateLargePortfolioRef(uint256 numMarkets) internal pure returns (string memory) {
-        // Simulate a storage reference that encodes portfolio size
-        // Format: "agent-{id}-portfolio-{numMarkets}-{timestamp}"
-        // In practice, the actual JSON is stored off-chain
         bytes memory ref = abi.encodePacked(
             "agent-1-portfolio-",
             _uint2str(numMarkets),
@@ -515,7 +1367,6 @@ contract AgiArenaCoreTest is Test {
         return string(ref);
     }
 
-    /// @notice Helper to convert uint to string
     function _uint2str(uint256 value) internal pure returns (string memory) {
         if (value == 0) return "0";
         uint256 temp = value;
@@ -531,321 +1382,5 @@ contract AgiArenaCoreTest is Test {
             value /= 10;
         }
         return string(buffer);
-    }
-
-    /// @notice Test placing a bet with a large portfolio (5000+ markets)
-    /// @dev Simulates large portfolio by using long jsonStorageRef string
-    function test_LargePortfolio_5000Markets() public {
-        string memory largeRef = _generateLargePortfolioRef(5000);
-        bytes32 largeHash = keccak256(bytes(largeRef));
-        uint256 betAmount = 1000e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(largeHash, largeRef, betAmount);
-
-        // Verify bet placed successfully
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(bet.betHash, largeHash);
-        assertEq(keccak256(bytes(bet.jsonStorageRef)), keccak256(bytes(largeRef)));
-        assertEq(bet.amount, betAmount);
-    }
-
-    /// @notice Gas measurement test for varying portfolio sizes
-    /// @dev Tests with 10, 100, 1000, 5000 market references to document gas costs
-    function test_LargePortfolio_GasMeasurement() public {
-        uint256 betAmount = 100e6;
-        uint256[] memory marketCounts = new uint256[](4);
-        marketCounts[0] = 10;
-        marketCounts[1] = 100;
-        marketCounts[2] = 1000;
-        marketCounts[3] = 5000;
-
-        for (uint256 i = 0; i < marketCounts.length; i++) {
-            string memory ref = _generateLargePortfolioRef(marketCounts[i]);
-            bytes32 hash = keccak256(bytes(ref));
-
-            vm.prank(trader1);
-            uint256 betId = core.placeBet(hash, ref, betAmount);
-
-            // Verify each bet was placed
-            AgiArenaCore.Bet memory bet = core.getBetState(betId);
-            assertEq(bet.betHash, hash);
-            assertEq(bet.amount, betAmount);
-        }
-
-        // All 4 bets should have been placed
-        assertEq(core.nextBetId(), 4);
-    }
-
-    /// @notice Test matching a large portfolio bet
-    function test_LargePortfolio_MatchBet() public {
-        string memory largeRef = _generateLargePortfolioRef(5000);
-        bytes32 largeHash = keccak256(bytes(largeRef));
-        uint256 betAmount = 1000e6;
-
-        // Place large portfolio bet
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(largeHash, largeRef, betAmount);
-
-        // Match the bet fully
-        vm.prank(trader2);
-        core.matchBet(betId, betAmount);
-
-        // Verify bet is fully matched
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
-        assertEq(bet.matchedAmount, betAmount);
-    }
-
-    /// @notice Test partial fills on large portfolio
-    function test_LargePortfolio_PartialFills() public {
-        string memory largeRef = _generateLargePortfolioRef(5000);
-        bytes32 largeHash = keccak256(bytes(largeRef));
-        uint256 betAmount = 1000e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(largeHash, largeRef, betAmount);
-
-        // Multiple partial fills
-        vm.prank(trader2);
-        core.matchBet(betId, 300e6); // 30%
-
-        vm.prank(trader3);
-        core.matchBet(betId, 500e6); // 50%
-
-        vm.prank(trader2);
-        core.matchBet(betId, 200e6); // Final 20%
-
-        // Verify fully matched
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
-        assertEq(core.getBetFillCount(betId), 3);
-    }
-
-    // ============ Portfolio Hash Verification Tests (AC: 1) ============
-
-    /// @notice Test hash verification with large portfolio (1000+ markets)
-    function test_PortfolioHashVerification_1000Markets() public {
-        // Generate a simulated large portfolio JSON reference
-        string memory largeRef = _generateLargePortfolioRef(1000);
-        bytes32 expectedHash = keccak256(bytes(largeRef));
-
-        // Place bet with this hash
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(expectedHash, largeRef, 1000e6);
-
-        // Retrieve and verify
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-
-        // Verify hash matches what we computed
-        assertEq(bet.betHash, expectedHash);
-
-        // Verify we can recompute hash from stored ref
-        assertEq(keccak256(bytes(bet.jsonStorageRef)), expectedHash);
-    }
-
-    /// @notice Test hash mismatch scenarios
-    function test_PortfolioHashVerification_Mismatch() public {
-        string memory originalRef = _generateLargePortfolioRef(1000);
-        string memory tamperedRef = _generateLargePortfolioRef(1001); // Different!
-
-        bytes32 originalHash = keccak256(bytes(originalRef));
-        bytes32 tamperedHash = keccak256(bytes(tamperedRef));
-
-        // Hashes should be different
-        assertTrue(originalHash != tamperedHash, "Hashes should differ for different content");
-
-        // Place bet with original hash
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(originalHash, originalRef, 1000e6);
-
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-
-        // Stored hash should NOT match tampered content hash
-        assertTrue(bet.betHash != tamperedHash, "Stored hash should not match tampered content");
-    }
-
-    // ============ Event Emission Tests (AC: 5) ============
-
-    /// @notice Test BetPlaced event includes jsonStorageRef
-    function test_BetPlaced_EventIncludesJsonStorageRef() public {
-        string memory jsonRef = "agent-42-portfolio-comprehensive-test";
-        bytes32 betHash = keccak256(bytes(jsonRef));
-        uint256 betAmount = 500e6;
-
-        // Expect event with all parameters including jsonStorageRef
-        vm.expectEmit(true, true, false, true);
-        emit BetPlaced(0, trader1, betHash, jsonRef, betAmount);
-
-        vm.prank(trader1);
-        core.placeBet(betHash, jsonRef, betAmount);
-    }
-
-    /// @notice Test BetMatched event emission
-    function test_BetMatched_EventEmission() public {
-        uint256 betAmount = 1000e6;
-        uint256 fillAmount = 400e6;
-        uint256 expectedRemaining = 600e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
-
-        // Expect BetMatched event with correct parameters
-        vm.expectEmit(true, true, false, true);
-        emit BetMatched(betId, trader2, fillAmount, expectedRemaining);
-
-        vm.prank(trader2);
-        core.matchBet(betId, fillAmount);
-    }
-
-    /// @notice Test BetCancelled event emission
-    function test_BetCancelled_EventEmission() public {
-        uint256 betAmount = 1000e6;
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, betAmount);
-
-        // Expect BetCancelled event with full refund
-        vm.expectEmit(true, true, false, true);
-        emit BetCancelled(betId, trader1, betAmount);
-
-        vm.prank(trader1);
-        core.cancelBet(betId);
-    }
-
-    /// @notice Test all event parameters are correctly emitted in sequence
-    function test_EventSequence_FullBettingFlow() public {
-        string memory jsonRef = "agent-1-bet-sequential-test";
-        bytes32 betHash = keccak256(bytes(jsonRef));
-        uint256 betAmount = 1000e6;
-
-        // Event 1: BetPlaced
-        vm.expectEmit(true, true, false, true);
-        emit BetPlaced(0, trader1, betHash, jsonRef, betAmount);
-
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(betHash, jsonRef, betAmount);
-
-        // Event 2: BetMatched (partial)
-        vm.expectEmit(true, true, false, true);
-        emit BetMatched(betId, trader2, 300e6, 700e6);
-
-        vm.prank(trader2);
-        core.matchBet(betId, 300e6);
-
-        // Event 3: BetMatched (complete)
-        vm.expectEmit(true, true, false, true);
-        emit BetMatched(betId, trader3, 700e6, 0);
-
-        vm.prank(trader3);
-        core.matchBet(betId, 700e6);
-    }
-
-    // ============ Integration Tests (AC: 1) ============
-
-    /// @notice Full betting flow: place -> partial fill -> more fills -> full match
-    function test_FullBettingFlow() public {
-        string memory jsonRef = "agent-integration-test-full-flow";
-        bytes32 betHash = keccak256(bytes(jsonRef));
-        uint256 betAmount = 1000e6;
-
-        // Step 1: Place bet
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(betHash, jsonRef, betAmount);
-
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Pending));
-        assertEq(bet.matchedAmount, 0);
-
-        // Step 2: First partial fill (30%)
-        vm.prank(trader2);
-        core.matchBet(betId, 300e6);
-
-        bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
-        assertEq(bet.matchedAmount, 300e6);
-
-        // Step 3: Second partial fill (50%)
-        vm.prank(trader3);
-        core.matchBet(betId, 500e6);
-
-        bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
-        assertEq(bet.matchedAmount, 800e6);
-
-        // Step 4: Final fill (20%) - completes the bet
-        vm.prank(trader2);
-        core.matchBet(betId, 200e6);
-
-        bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched));
-        assertEq(bet.matchedAmount, 1000e6);
-
-        // Verify fill records
-        assertEq(core.getBetFillCount(betId), 3);
-        AgiArenaCore.Fill[] memory fills = core.getBetFills(betId);
-        assertEq(fills[0].filler, trader2);
-        assertEq(fills[0].amount, 300e6);
-        assertEq(fills[1].filler, trader3);
-        assertEq(fills[1].amount, 500e6);
-        assertEq(fills[2].filler, trader2);
-        assertEq(fills[2].amount, 200e6);
-
-        // Verify USDC balances
-        assertEq(usdc.balanceOf(trader1), INITIAL_BALANCE - betAmount);
-        assertEq(usdc.balanceOf(trader2), INITIAL_BALANCE - 500e6); // 300 + 200
-        assertEq(usdc.balanceOf(trader3), INITIAL_BALANCE - 500e6);
-        assertEq(usdc.balanceOf(address(core)), betAmount * 2); // Both sides escrowed
-    }
-
-    /// @notice Test cancel remaining after partial fill
-    function test_CancelPartiallyMatchedBet() public {
-        string memory jsonRef = "agent-cancel-partial-test";
-        bytes32 betHash = keccak256(bytes(jsonRef));
-        uint256 betAmount = 1000e6;
-
-        // Place bet
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(betHash, jsonRef, betAmount);
-
-        // Partial fill
-        vm.prank(trader2);
-        core.matchBet(betId, 400e6);
-
-        uint256 trader1BalanceBefore = usdc.balanceOf(trader1);
-
-        // Cancel remaining
-        vm.prank(trader1);
-        core.cancelBet(betId);
-
-        // Verify state
-        AgiArenaCore.Bet memory bet = core.getBetState(betId);
-        assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.FullyMatched)); // Closed status
-        assertEq(bet.matchedAmount, 400e6); // Still has matched amount
-
-        // Verify refund of unfilled portion (600 USDC)
-        assertEq(usdc.balanceOf(trader1), trader1BalanceBefore + 600e6);
-
-        // Contract still holds matched amounts from both parties
-        assertEq(usdc.balanceOf(address(core)), 800e6); // 400 from trader1 + 400 from trader2
-    }
-
-    /// @notice Test state transitions are correct throughout lifecycle
-    function test_BetStateTransitions() public {
-        vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6);
-
-        // Initial: Pending
-        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.Pending));
-
-        // After partial: PartiallyMatched
-        vm.prank(trader2);
-        core.matchBet(betId, 100e6);
-        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.PartiallyMatched));
-
-        // After full: FullyMatched
-        vm.prank(trader2);
-        core.matchBet(betId, 900e6);
-        assertEq(uint256(core.getBetState(betId).status), uint256(AgiArenaCore.BetStatus.FullyMatched));
     }
 }
