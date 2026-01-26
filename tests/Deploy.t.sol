@@ -22,9 +22,9 @@ contract DeployTest is Test {
         deployScript = new Deploy();
     }
 
-    /// @notice Verify the USDC constant is set correctly for Base mainnet
-    function test_USDC_Constant() public view {
-        assertEq(deployScript.USDC_BASE(), EXPECTED_USDC, "USDC address mismatch");
+    /// @notice Verify the default collateral constant is set correctly
+    function test_DefaultCollateral_Constant() public view {
+        assertEq(deployScript.DEFAULT_COLLATERAL(), EXPECTED_USDC, "Default collateral address mismatch");
     }
 
     /// @notice Test deployment with mock private key
@@ -40,7 +40,7 @@ contract DeployTest is Test {
 
         // Verify AgiArenaCore deployment
         assertTrue(address(core) != address(0), "AgiArenaCore not deployed");
-        assertEq(address(core.USDC()), EXPECTED_USDC, "USDC not set correctly");
+        assertEq(address(core.COLLATERAL_TOKEN()), EXPECTED_USDC, "Collateral token not set correctly");
         assertEq(core.PLATFORM_FEE_BPS(), 10, "Platform fee not 10 bps");
         assertEq(core.nextBetId(), 0, "nextBetId should start at 0");
 

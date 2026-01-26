@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title IAgiArenaCore
@@ -22,7 +23,7 @@ interface IAgiArenaCore {
     struct Bet {
         bytes32 betHash;
         string jsonStorageRef;
-        uint256 creatorStake;      // Creator's USDC stake (6 decimals)
+        uint256 creatorStake;      // Creator's collateral stake (decimals vary)
         uint256 requiredMatch;     // Required matcher stake (calculated from odds)
         uint256 matchedAmount;
         uint32 oddsBps;            // Odds in basis points (10000 = 1.00x)
@@ -54,8 +55,8 @@ interface IAgiArenaCore {
     /// @notice Get all fills for a bet
     function getBetFills(uint256 betId) external view returns (Fill[] memory);
 
-    /// @notice Get the USDC token address
-    function USDC() external view returns (IERC20);
+    /// @notice Get the collateral token address
+    function COLLATERAL_TOKEN() external view returns (IERC20);
 
     /// @notice Get the fee recipient address
     function FEE_RECIPIENT() external view returns (address);
@@ -226,13 +227,13 @@ contract ResolutionDAO is ReentrancyGuard {
 
     // ============ Dispute Constants (Story 3.4) ============
 
-    /// @notice Minimum stake required to raise a dispute (10 USDC)
-    /// @dev 10 * 10^6 = 10,000,000 (USDC has 6 decimals)
-    uint256 public constant MIN_DISPUTE_STAKE = 10 * 1e6;
+    /// @notice Minimum stake required to raise a dispute (10 tokens)
+    /// @dev Set dynamically based on collateral token decimals
+    uint256 public immutable MIN_DISPUTE_STAKE;
 
-    /// @notice Amount slashed from keeper for incorrect scores (1 cent USDC for testing)
-    /// @dev 0.01 * 10^6 = 10,000 (1 cent USDC)
-    uint256 public constant KEEPER_SLASH_AMOUNT = 10000;
+    /// @notice Amount slashed from keeper for incorrect scores (0.01 tokens)
+    /// @dev Set dynamically based on collateral token decimals
+    uint256 public immutable KEEPER_SLASH_AMOUNT;
 
     /// @notice Dispute reward in basis points (5% of total pot)
     uint256 public constant DISPUTE_REWARD_BPS = 500;
@@ -253,6 +254,9 @@ contract ResolutionDAO is ReentrancyGuard {
 
     /// @notice Maximum length for dispute reason string (500 bytes)
     uint256 public constant MAX_DISPUTE_REASON_LENGTH = 500;
+
+    /// @notice Maximum batch size for batch operations (gas limit protection)
+    uint256 public constant MAX_BATCH_SIZE = 50;
 
     // ============ Structs ============
 
@@ -519,6 +523,16 @@ contract ResolutionDAO is ReentrancyGuard {
         isKeeper[initialKeeper] = true;
         keepers.push(initialKeeper);
 
+        // Set dispute stake and slash amount based on collateral token decimals
+        uint8 decimals = agiArenaCore != address(0)
+            ? IERC20Metadata(address(IAgiArenaCore(agiArenaCore).COLLATERAL_TOKEN())).decimals()
+            : 6; // Default to 6 decimals (USDC)
+
+        // 10 tokens for dispute stake
+        MIN_DISPUTE_STAKE = 10 * (10 ** decimals);
+        // 0.01 tokens for keeper slash
+        KEEPER_SLASH_AMOUNT = 10 ** (decimals - 2);
+
         // Emit event for indexing (proposalId 0 = bootstrap)
         emit KeeperAdded(initialKeeper, 0);
     }
@@ -693,6 +707,52 @@ contract ResolutionDAO is ReentrancyGuard {
         _checkConsensus(betId);
     }
 
+    /// @notice Batch vote on multiple portfolio scores in one transaction (gas efficient)
+    /// @dev Only callable by authorized keeper
+    /// @dev Skips bets where keeper has already voted (no revert)
+    /// @param betIds Array of bet IDs to vote on
+    /// @param aggregateScores Array of aggregate scores in basis points
+    /// @param creatorWinsFlags Array of outcome flags (true = creator wins)
+    function voteOnPortfolioScores(
+        uint256[] calldata betIds,
+        int256[] calldata aggregateScores,
+        bool[] calldata creatorWinsFlags
+    ) external nonReentrant onlyKeeper {
+        // Validate array lengths match
+        require(betIds.length == aggregateScores.length && betIds.length == creatorWinsFlags.length, "Array length mismatch");
+        require(betIds.length <= MAX_BATCH_SIZE, "Batch too large");
+
+        for (uint256 i = 0; i < betIds.length; i++) {
+            // Skip if already voted (don't revert)
+            if (hasVotedOnBet[betIds[i]][msg.sender]) {
+                continue;
+            }
+
+            // Validate score range
+            if (aggregateScores[i] < MIN_SCORE || aggregateScores[i] > MAX_SCORE) {
+                continue; // Skip invalid scores in batch mode
+            }
+
+            // Record vote
+            hasVotedOnBet[betIds[i]][msg.sender] = true;
+            _betScoreVotes[betIds[i]].push(
+                ScoreVote({
+                    keeper: msg.sender,
+                    score: aggregateScores[i],
+                    creatorWins: creatorWinsFlags[i],
+                    votedAt: block.timestamp
+                })
+            );
+
+            // Emit events
+            emit PortfolioScoreVoted(betIds[i], msg.sender, aggregateScores[i], creatorWinsFlags[i]);
+            emit VoteCast(betIds[i], msg.sender, aggregateScores[i], creatorWinsFlags[i]);
+
+            // Check for consensus
+            _checkConsensus(betIds[i]);
+        }
+    }
+
     /// @notice Get vote status for a bet
     /// @param betId The bet ID to query
     /// @return voteCount Number of votes cast
@@ -827,6 +887,22 @@ contract ResolutionDAO is ReentrancyGuard {
     ///      If bet was disputed, uses corrected score if outcome changed.
     /// @param betId The bet ID to settle
     function settleBet(uint256 betId) external nonReentrant {
+        _settleBetInternal(betId);
+    }
+
+    /// @notice Batch settle multiple bets in one transaction (gas efficient)
+    /// @dev Permissionless - anyone can call. Skips bets that can't be settled.
+    /// @param betIds Array of bet IDs to settle
+    function settleBets(uint256[] calldata betIds) external nonReentrant {
+        require(betIds.length <= MAX_BATCH_SIZE, "Batch too large");
+
+        for (uint256 i = 0; i < betIds.length; i++) {
+            _settleBetInternalSafe(betIds[i]);
+        }
+    }
+
+    /// @dev Internal settlement logic
+    function _settleBetInternal(uint256 betId) internal {
         // Check consensus reached
         if (!consensusReached[betId]) revert ConsensusNotReached(betId);
 
@@ -841,6 +917,21 @@ contract ResolutionDAO is ReentrancyGuard {
         }
 
         // Execute settlement in helper to avoid stack too deep
+        _executeSettlement(betId);
+    }
+
+    /// @dev Safe version that doesn't revert on failure (for batch operations)
+    function _settleBetInternalSafe(uint256 betId) internal {
+        // Skip if no consensus
+        if (!consensusReached[betId]) return;
+
+        // Skip if already settled
+        if (betSettled[betId]) return;
+
+        // Skip if disputed but not resolved
+        if (isDisputed[betId] && disputes[betId].resolvedAt == 0) return;
+
+        // Try to execute settlement (may fail for other reasons)
         _executeSettlement(betId);
     }
 
@@ -1027,7 +1118,7 @@ contract ResolutionDAO is ReentrancyGuard {
 
         // Get USDC from AgiArenaCore and transfer to claimant
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
-        IERC20 usdc = core.USDC();
+        IERC20 usdc = core.COLLATERAL_TOKEN();
 
         // Transfer from AgiArenaCore's balance to claimant
         // NOTE: This requires AgiArenaCore to have approved ResolutionDAO to transfer USDC
@@ -1048,7 +1139,7 @@ contract ResolutionDAO is ReentrancyGuard {
         // Get fee recipient and USDC from AgiArenaCore
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
         address feeRecipient = core.FEE_RECIPIENT();
-        IERC20 usdc = core.USDC();
+        IERC20 usdc = core.COLLATERAL_TOKEN();
 
         // Transfer fees from AgiArenaCore to fee recipient
         usdc.safeTransferFrom(AGIARENA_CORE, feeRecipient, fees);
@@ -1148,7 +1239,7 @@ contract ResolutionDAO is ReentrancyGuard {
 
         // Transfer stake from disputer to this contract (CEI: effects before interactions, but transfer needed first)
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
-        IERC20 usdc = core.USDC();
+        IERC20 usdc = core.COLLATERAL_TOKEN();
         usdc.safeTransferFrom(msg.sender, address(this), stakeAmount);
 
         // Record dispute state
@@ -1266,7 +1357,7 @@ contract ResolutionDAO is ReentrancyGuard {
 
         // Transfer to disputer
         IAgiArenaCore core = IAgiArenaCore(AGIARENA_CORE);
-        IERC20 usdc = core.USDC();
+        IERC20 usdc = core.COLLATERAL_TOKEN();
 
         // Transfer stake back from this contract
         usdc.safeTransfer(dispute.disputer, stakeAmount);

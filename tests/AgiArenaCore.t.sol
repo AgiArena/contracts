@@ -42,6 +42,9 @@ contract AgiArenaCoreTest is Test {
     uint32 constant ODDS_05X = 5000;   // 0.50x
     uint32 constant ODDS_15X = 15000;  // 1.50x
 
+    // Default deadline: 1 day from now (used in tests)
+    uint256 constant DEFAULT_DEADLINE = 1 days;
+
     event BetPlaced(
         uint256 indexed betId,
         address indexed creator,
@@ -49,7 +52,8 @@ contract AgiArenaCoreTest is Test {
         string jsonStorageRef,
         uint256 creatorStake,
         uint256 requiredMatch,
-        uint32 oddsBps
+        uint32 oddsBps,
+        uint256 resolutionDeadline
     );
     event BetMatched(uint256 indexed betId, address indexed filler, uint256 fillAmount, uint256 remaining);
     event BetCancelled(uint256 indexed betId, address indexed creator, uint256 refundAmount);
@@ -81,7 +85,7 @@ contract AgiArenaCoreTest is Test {
     // ============ Constructor Tests ============
 
     function test_Constructor() public view {
-        assertEq(address(core.USDC()), address(usdc));
+        assertEq(address(core.COLLATERAL_TOKEN()), address(usdc));
         assertEq(core.FEE_RECIPIENT(), feeRecipient);
         assertEq(core.RESOLVER(), resolver);
         assertEq(core.PLATFORM_FEE_BPS(), 10);
@@ -111,7 +115,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6; // 1k USDC
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Verify bet ID
         assertEq(betId, 0);
@@ -139,7 +143,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRequiredMatch = 500e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.creatorStake, creatorStake);
@@ -153,7 +157,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRequiredMatch = 2000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.creatorStake, creatorStake);
@@ -167,7 +171,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRequiredMatch = 666666666; // ~666.67 USDC (truncated)
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_15X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_15X, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.creatorStake, creatorStake);
@@ -178,18 +182,19 @@ contract AgiArenaCoreTest is Test {
     function test_PlacePortfolioBet_EmitsEventWithOdds() public {
         uint256 creatorStake = 500e6;
         uint256 expectedRequiredMatch = 250e6; // 2.00x odds
+        uint256 deadline = block.timestamp + DEFAULT_DEADLINE;
 
         vm.expectEmit(true, true, false, true);
-        emit BetPlaced(0, trader1, TEST_BET_HASH, TEST_JSON_REF, creatorStake, expectedRequiredMatch, ODDS_2X);
+        emit BetPlaced(0, trader1, TEST_BET_HASH, TEST_JSON_REF, creatorStake, expectedRequiredMatch, ODDS_2X, deadline);
 
         vm.prank(trader1);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, deadline);
     }
 
     function test_PlacePortfolioBet_InvalidOdds_Zero() public {
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.InvalidOdds.selector);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, 0);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, 0, block.timestamp + DEFAULT_DEADLINE);
     }
 
     function test_PlacePortfolioBet_ExtremeOdds_1bps() public {
@@ -199,7 +204,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRequiredMatch = 10_000_000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.requiredMatch, expectedRequiredMatch);
@@ -213,7 +218,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRequiredMatch = 10e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1_000_000);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, 1_000_000, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.requiredMatch, expectedRequiredMatch);
@@ -226,7 +231,7 @@ contract AgiArenaCoreTest is Test {
         // With 1 wei stake and max uint32 bps: (1 * 10000) / 4294967295 = 0 (truncated)
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1, type(uint32).max);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1, type(uint32).max, block.timestamp + DEFAULT_DEADLINE);
     }
 
     function test_PlacePortfolioBet_InsufficientBalance() public {
@@ -234,27 +239,27 @@ contract AgiArenaCoreTest is Test {
 
         vm.prank(trader1);
         vm.expectRevert(abi.encodeWithSelector(AgiArenaCore.InsufficientBalance.selector, creatorStake, INITIAL_BALANCE));
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
     }
 
     function test_PlacePortfolioBet_ZeroAmount() public {
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
-        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 0, ODDS_EVEN);
+        core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 0, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
     }
 
     function test_PlacePortfolioBet_InvalidHash() public {
         vm.prank(trader1);
         vm.expectRevert(AgiArenaCore.InvalidBetHash.selector);
-        core.placeBet(bytes32(0), TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        core.placeBet(bytes32(0), TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
     }
 
     function test_PlaceMultipleBets() public {
         vm.startPrank(trader1);
 
-        uint256 bet1 = core.placeBet(TEST_BET_HASH, "ref-1", 100e6, ODDS_EVEN);
-        uint256 bet2 = core.placeBet(keccak256("portfolio-2"), "ref-2", 200e6, ODDS_2X);
-        uint256 bet3 = core.placeBet(keccak256("portfolio-3"), "ref-3", 300e6, ODDS_05X);
+        uint256 bet1 = core.placeBet(TEST_BET_HASH, "ref-1", 100e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
+        uint256 bet2 = core.placeBet(keccak256("portfolio-2"), "ref-2", 200e6, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
+        uint256 bet3 = core.placeBet(keccak256("portfolio-3"), "ref-3", 300e6, ODDS_05X, block.timestamp + DEFAULT_DEADLINE);
 
         vm.stopPrank();
 
@@ -271,7 +276,7 @@ contract AgiArenaCoreTest is Test {
 
         // Trader1 places bet with even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Trader2 fully matches (requiredMatch == creatorStake at 1.00x)
         vm.prank(trader2);
@@ -293,7 +298,7 @@ contract AgiArenaCoreTest is Test {
 
         // Trader1 places bet with 2.00x odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Trader2 fully matches (only needs 500 USDC)
         vm.prank(trader2);
@@ -315,7 +320,7 @@ contract AgiArenaCoreTest is Test {
 
         // Trader1 places bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Trader2 partially matches
         vm.prank(trader2);
@@ -336,7 +341,7 @@ contract AgiArenaCoreTest is Test {
 
         // Trader1 places bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Multiple partial fills
         vm.prank(trader2);
@@ -363,7 +368,7 @@ contract AgiArenaCoreTest is Test {
         uint256 remainingAfterFill = 300e6; // requiredMatch(500) - fill(200) = 300
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         vm.expectEmit(true, true, false, true);
         emit BetMatched(betId, trader2, fillAmount, remainingAfterFill);
@@ -377,7 +382,7 @@ contract AgiArenaCoreTest is Test {
         uint256 requiredMatch = 500e6; // At 2.00x odds
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Try to fill more than requiredMatch
         vm.prank(trader2);
@@ -393,7 +398,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_MatchPortfolioBet_ZeroAmount() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         vm.expectRevert(AgiArenaCore.ZeroAmount.selector);
@@ -405,7 +410,7 @@ contract AgiArenaCoreTest is Test {
         uint256 requiredMatch = 500e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Fully match
         vm.prank(trader2);
@@ -421,7 +426,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Drain trader2's balance
         vm.prank(trader2);
@@ -439,7 +444,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
@@ -459,7 +464,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
@@ -481,7 +486,7 @@ contract AgiArenaCoreTest is Test {
         uint256 expectedRefund = 600e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Partially match
         vm.prank(trader2);
@@ -509,7 +514,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.expectEmit(true, true, false, true);
         emit BetCancelled(betId, trader1, creatorStake);
@@ -523,7 +528,7 @@ contract AgiArenaCoreTest is Test {
         uint256 requiredMatch = 500e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Fully match
         vm.prank(trader2);
@@ -537,7 +542,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_CancelPortfolioBet_Unauthorized() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Try to cancel as different user
         vm.prank(trader2);
@@ -556,7 +561,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         uint256 balanceBeforeCancel = usdc.balanceOf(trader1);
 
@@ -574,7 +579,7 @@ contract AgiArenaCoreTest is Test {
         // requiredMatch = 900 * 10000 / 30000 = 300
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.requiredMatch, 300e6);
@@ -591,7 +596,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_MatchPortfolioBet_CannotSelfMatch() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Creator trying to match their own bet should fail
         vm.prank(trader1);
@@ -613,7 +618,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet with even odds (1.00x)
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Verify requiredMatch equals creatorStake
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
@@ -635,7 +640,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Partial fill
         vm.prank(trader2);
@@ -669,7 +674,7 @@ contract AgiArenaCoreTest is Test {
         if (expectedRequiredMatch == 0) return;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.creatorStake, creatorStake);
@@ -692,7 +697,7 @@ contract AgiArenaCoreTest is Test {
         if (fillAmount > INITIAL_BALANCE) return; // Skip if filler can't afford
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, fillAmount);
@@ -712,7 +717,7 @@ contract AgiArenaCoreTest is Test {
         vm.assume(requiredMatch > 0);
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(bet.oddsBps, oddsBps);
@@ -735,7 +740,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         // Partially match
         vm.prank(trader2);
@@ -770,7 +775,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         uint256 balanceBefore = usdc.balanceOf(trader1);
 
@@ -791,22 +796,22 @@ contract AgiArenaCoreTest is Test {
 
         // 2.00x odds: requiredMatch = $50
         vm.prank(trader1);
-        uint256 bet1 = core.placeBet(keccak256("bet1"), "ref1", creatorStake, 20000);
+        uint256 bet1 = core.placeBet(keccak256("bet1"), "ref1", creatorStake, 20000, block.timestamp + DEFAULT_DEADLINE);
         assertEq(core.getBetState(bet1).requiredMatch, 50e6);
 
         // 1.50x odds: requiredMatch = ~$66.67
         vm.prank(trader1);
-        uint256 bet2 = core.placeBet(keccak256("bet2"), "ref2", creatorStake, 15000);
+        uint256 bet2 = core.placeBet(keccak256("bet2"), "ref2", creatorStake, 15000, block.timestamp + DEFAULT_DEADLINE);
         assertEq(core.getBetState(bet2).requiredMatch, 66666666); // ~66.67
 
         // 1.00x odds: requiredMatch = $100
         vm.prank(trader1);
-        uint256 bet3 = core.placeBet(keccak256("bet3"), "ref3", creatorStake, 10000);
+        uint256 bet3 = core.placeBet(keccak256("bet3"), "ref3", creatorStake, 10000, block.timestamp + DEFAULT_DEADLINE);
         assertEq(core.getBetState(bet3).requiredMatch, 100e6);
 
         // 0.50x odds: requiredMatch = $200
         vm.prank(trader1);
-        uint256 bet4 = core.placeBet(keccak256("bet4"), "ref4", creatorStake, 5000);
+        uint256 bet4 = core.placeBet(keccak256("bet4"), "ref4", creatorStake, 5000, block.timestamp + DEFAULT_DEADLINE);
         assertEq(core.getBetState(bet4).requiredMatch, 200e6);
     }
 
@@ -819,7 +824,7 @@ contract AgiArenaCoreTest is Test {
 
         // Step 1: Place bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, odds);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, odds, block.timestamp + DEFAULT_DEADLINE);
 
         AgiArenaCore.Bet memory bet = core.getBetState(betId);
         assertEq(uint256(bet.status), uint256(AgiArenaCore.BetStatus.Pending));
@@ -858,7 +863,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_BetStateTransitions_WithOdds() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
         // requiredMatch = 500e6
 
         // Initial: Pending
@@ -882,7 +887,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place and fully match bet at even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -916,7 +921,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place and fully match bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, requiredMatch);
@@ -942,7 +947,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place and match at even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -967,7 +972,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_2X, block.timestamp + DEFAULT_DEADLINE);
 
         // Multiple matchers - trader2 fills 300, trader3 fills 200
         vm.prank(trader2);
@@ -1004,7 +1009,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet at even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Three matchers with different fill amounts
         address trader4 = address(0x4);
@@ -1047,7 +1052,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -1067,7 +1072,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -1087,7 +1092,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -1106,7 +1111,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_SettleBet_BetNotFullyMatched_Pending() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Bet is pending, not fully matched
         vm.prank(resolver);
@@ -1116,7 +1121,7 @@ contract AgiArenaCoreTest is Test {
 
     function test_SettleBet_BetNotFullyMatched_PartiallyMatched() public {
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, 1000e6, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, 500e6); // Only partially matched
@@ -1130,7 +1135,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, creatorStake);
@@ -1150,7 +1155,7 @@ contract AgiArenaCoreTest is Test {
 
         // Place bet at even odds
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Same matcher fills multiple times
         vm.prank(trader2);
@@ -1183,7 +1188,7 @@ contract AgiArenaCoreTest is Test {
         uint256 requiredMatch = 100e6; // 0.50x odds
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_05X, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, requiredMatch);
@@ -1207,7 +1212,7 @@ contract AgiArenaCoreTest is Test {
         uint256 requiredMatch = 300e6; // 3.00x odds
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_3X, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, requiredMatch);
@@ -1230,7 +1235,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 10000e6;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Create 100 matchers, each filling 100e6
         for (uint256 i = 0; i < 100; i++) {
@@ -1260,7 +1265,7 @@ contract AgiArenaCoreTest is Test {
         usdc.mint(trader1, 200e6);
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         // Create MAX_MATCHERS (100) fills
         for (uint256 i = 0; i < 100; i++) {
@@ -1288,7 +1293,7 @@ contract AgiArenaCoreTest is Test {
         uint256 creatorStake = 1; // 0.000001 USDC
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, ODDS_EVEN, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, 1);
@@ -1308,7 +1313,7 @@ contract AgiArenaCoreTest is Test {
         if (requiredMatch == 0 || requiredMatch > INITIAL_BALANCE) return;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, requiredMatch);
@@ -1335,7 +1340,7 @@ contract AgiArenaCoreTest is Test {
         if (requiredMatch == 0 || requiredMatch > INITIAL_BALANCE) return;
 
         vm.prank(trader1);
-        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps);
+        uint256 betId = core.placeBet(TEST_BET_HASH, TEST_JSON_REF, creatorStake, oddsBps, block.timestamp + DEFAULT_DEADLINE);
 
         vm.prank(trader2);
         core.matchBet(betId, requiredMatch);
