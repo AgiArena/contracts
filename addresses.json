@@ -1,15 +1,21 @@
 {
-  "network": "base-mainnet",
-  "chainId": 8453,
-  "deployedAt": "2026-01-25T12:00:00Z",
-  "contracts": {
-    "AgiArenaCore": "0xcb6C040bd4E1742840AD5542C6fDDaF74dB73AF6",
-    "ResolutionDAO": "0x2A57a0420be53C235b28681760cAE868FFb85118"
+  "networks": {
+    "index-l3": {
+      "chainId": 111222333,
+      "deployedAt": "2026-01-26T12:00:00Z",
+      "contracts": {
+        "AgiArenaCore": "0x0A6beBb4Ac6E4779D4F903f1017676973a750a18",
+        "ResolutionDAO": "0x7E4dC335A96E8Ea4097e3bfFff7aDcB221d1f096"
+      },
+      "collateralToken": {
+        "symbol": "WIND",
+        "decimals": 18,
+        "address": "0x6Ef9653b34C2A0d91219466b029428ff4F49D651"
+      },
+      "external": {
+        "polymarketApiUrl": "https://clob.polymarket.com"
+      }
+    }
   },
-  "tokens": {
-    "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-  },
-  "external": {
-    "polymarketApiUrl": "https://clob.polymarket.com"
-  }
+  "activeNetwork": "index-l3"
 }
