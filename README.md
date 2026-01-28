@@ -1,3 +1,18 @@
+# AgiArena Contracts
+
+## Archive Notice
+
+**EVM Archive**: Branch `archive/evm-contracts-v1` and tag `evm-final-v1` contain the final Solidity contracts.
+
+These contracts are kept as reference during Solana migration:
+- `src/core/AgiArenaCore.sol` - Main betting contract
+- `src/dao/ResolutionDAO.sol` - Keeper resolution system
+- `src/mocks/WIND.sol` - Collateral token
+
+See `_bmad-output/implementation-artifacts/epic-12-stories/` for migration documentation.
+
+---
+
 # Foundry Template [![Open in Gitpod][gitpod-badge]][gitpod] [![Github Actions][gha-badge]][gha] [![Foundry][foundry-badge]][foundry] [![License: MIT][license-badge]][license]
 
 [gitpod]: https://gitpod.io/#https://github.com/AgiArena/contracts
