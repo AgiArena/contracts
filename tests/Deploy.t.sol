@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import { Test, console } from "forge-std/src/Test.sol";
+import { Test } from "forge-std/src/Test.sol";
 import { Deploy } from "../script/Deploy.s.sol";
 import { AgiArenaCore } from "../src/core/AgiArenaCore.sol";
 import { ResolutionDAO } from "../src/dao/ResolutionDAO.sol";
+import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+/// @title MockUSDC
+/// @notice Mock USDC token for testing
+contract MockUSDC is ERC20 {
+    constructor() ERC20("USD Coin", "USDC") {}
+    function decimals() public pure override returns (uint8) { return 6; }
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+}
 
 /// @title DeployTest
 /// @notice Tests for the deployment script
 contract DeployTest is Test {
     Deploy public deployScript;
+    MockUSDC public mockUsdc;
 
     // Expected Base mainnet USDC address
     address public constant EXPECTED_USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -20,6 +30,7 @@ contract DeployTest is Test {
 
     function setUp() public {
         deployScript = new Deploy();
+        mockUsdc = new MockUSDC();
     }
 
     /// @notice Verify the default collateral constant is set correctly
@@ -33,6 +44,7 @@ contract DeployTest is Test {
         vm.setEnv("DEPLOYER_PRIVATE_KEY", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
         vm.setEnv("KEEPER1_ADDRESS", vm.toString(KEEPER1));
         vm.setEnv("KEEPER2_ADDRESS", vm.toString(KEEPER2));
+        vm.setEnv("COLLATERAL_TOKEN_ADDRESS", vm.toString(address(mockUsdc)));
 
         // Create fresh deploy script to pick up env vars
         Deploy freshDeploy = new Deploy();
@@ -40,7 +52,7 @@ contract DeployTest is Test {
 
         // Verify AgiArenaCore deployment
         assertTrue(address(core) != address(0), "AgiArenaCore not deployed");
-        assertEq(address(core.COLLATERAL_TOKEN()), EXPECTED_USDC, "Collateral token not set correctly");
+        assertEq(address(core.COLLATERAL_TOKEN()), address(mockUsdc), "Collateral token not set correctly");
         assertEq(core.PLATFORM_FEE_BPS(), 10, "Platform fee not 10 bps");
         assertEq(core.nextBetId(), 0, "nextBetId should start at 0");
 
@@ -62,6 +74,7 @@ contract DeployTest is Test {
         vm.setEnv("PLATFORM_FEE_RECIPIENT", vm.toString(customFeeRecipient));
         vm.setEnv("KEEPER1_ADDRESS", vm.toString(KEEPER1));
         vm.setEnv("KEEPER2_ADDRESS", vm.toString(KEEPER2));
+        vm.setEnv("COLLATERAL_TOKEN_ADDRESS", vm.toString(address(mockUsdc)));
 
         // Create fresh deploy script to pick up env vars
         Deploy freshDeploy = new Deploy();
@@ -83,6 +96,7 @@ contract DeployTest is Test {
         vm.setEnv("PLATFORM_FEE_RECIPIENT", "");
         vm.setEnv("KEEPER1_ADDRESS", vm.toString(KEEPER1));
         vm.setEnv("KEEPER2_ADDRESS", vm.toString(KEEPER2));
+        vm.setEnv("COLLATERAL_TOKEN_ADDRESS", vm.toString(address(mockUsdc)));
 
         // Create fresh deploy script to pick up env vars
         Deploy freshDeploy = new Deploy();
@@ -100,6 +114,7 @@ contract DeployTest is Test {
         vm.setEnv("DEPLOYER_PRIVATE_KEY", vm.toString(deployerPrivateKey));
         vm.setEnv("KEEPER1_ADDRESS", vm.toString(KEEPER1));
         vm.setEnv("KEEPER2_ADDRESS", vm.toString(KEEPER2));
+        vm.setEnv("COLLATERAL_TOKEN_ADDRESS", vm.toString(address(mockUsdc)));
 
         Deploy freshDeploy = new Deploy();
         (, ResolutionDAO resolutionDAO) = freshDeploy.run();

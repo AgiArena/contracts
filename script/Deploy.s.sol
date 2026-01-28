@@ -6,11 +6,13 @@ import { AgiArenaCore } from "../src/core/AgiArenaCore.sol";
 import { ResolutionDAO } from "../src/dao/ResolutionDAO.sol";
 
 /// @title Deploy
-/// @notice Deployment script for AgiArenaCore and ResolutionDAO to Base mainnet
+/// @notice Deployment script for AgiArenaCore and ResolutionDAO
 /// @dev Libraries (BettingLib, MatchingLib) are internal and linked at compile time - NOT separately deployed
+/// @dev Supports deployment to multiple chains with configurable collateral token
 contract Deploy is Script {
-    /// @notice Base Mainnet USDC address (official Circle contract)
-    address public constant USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    /// @notice Default collateral address (Base Mainnet USDC)
+    /// @dev Can be overridden via COLLATERAL_TOKEN_ADDRESS env var
+    address public constant DEFAULT_COLLATERAL = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
 
     /// @notice Run the deployment script
     /// @return core The deployed AgiArenaCore contract instance
@@ -24,6 +26,9 @@ contract Deploy is Script {
         // Fee recipient defaults to deployer, can be overridden via environment
         address feeRecipient = vm.envOr("PLATFORM_FEE_RECIPIENT", deployer);
 
+        // Collateral token - defaults to USDC on Base, can be IND on L3, etc.
+        address collateralToken = vm.envOr("COLLATERAL_TOKEN_ADDRESS", DEFAULT_COLLATERAL);
+
         // Load keeper addresses from environment (required for bootstrap)
         address keeper1 = vm.envAddress("KEEPER1_ADDRESS");
         address keeper2 = vm.envAddress("KEEPER2_ADDRESS");
@@ -34,7 +39,7 @@ contract Deploy is Script {
         console.log("=== AgiArena Deployment ===");
         console.log("Deployer:", deployer);
         console.log("Fee Recipient:", feeRecipient);
-        console.log("USDC Address:", USDC_BASE);
+        console.log("Collateral Token:", collateralToken);
         console.log("Chain ID:", block.chainid);
         console.log("");
         console.log("=== Keeper Bootstrap Addresses ===");
@@ -54,7 +59,7 @@ contract Deploy is Script {
         console.log("Predicted ResolutionDAO:", predictedResolutionDAO);
 
         // Step 1: Deploy AgiArenaCore with predicted ResolutionDAO as resolver
-        core = new AgiArenaCore(USDC_BASE, feeRecipient, predictedResolutionDAO);
+        core = new AgiArenaCore(collateralToken, feeRecipient, predictedResolutionDAO);
         console.log("");
         console.log("=== Contract Deployments ===");
         console.log("AgiArenaCore deployed to:", address(core));

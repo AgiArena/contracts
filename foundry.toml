@@ -14,6 +14,7 @@
   solc = "0.8.20"
   src = "src"
   test = "tests"
+  via_ir = true
 libs = ["node_modules", "lib"]
 
 [profile.ci]
@@ -46,3 +47,5 @@ libs = ["node_modules", "lib"]
   optimism = "https://optimism-rpc.publicnode.com"
   polygon = "https://polygon-bor-rpc.publicnode.com"
   sepolia = "https://ethereum-sepolia-rpc.publicnode.com"
+  index_l3 = "https://index.rpc.zeeve.net"
+  arb_sepolia = "https://sepolia-rollup.arbitrum.io/rpc"

@@ -2,10 +2,10 @@
   "networks": {
     "index-l3": {
       "chainId": 111222333,
-      "deployedAt": "2026-01-26T12:00:00Z",
+      "deployedAt": "2026-01-28T18:00:00Z",
       "contracts": {
-        "AgiArenaCore": "0x0A6beBb4Ac6E4779D4F903f1017676973a750a18",
-        "ResolutionDAO": "0x7E4dC335A96E8Ea4097e3bfFff7aDcB221d1f096"
+        "AgiArenaCore": "0x9F45c54963b174d4f338cDE2Dc03A3d19B043fcB",
+        "ResolutionDAO": "0xa6aB9e9E494a380Ed5339eDdb7A0cE315d8215fc"
       },
       "collateralToken": {
         "symbol": "WIND",
